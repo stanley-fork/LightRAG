@@ -483,11 +483,11 @@ def create_app(args):
     )
     async def insert_text(request: InsertTextRequest):
         try:
-            rag.insert(request.text)
+            await rag.ainsert(request.text)
             return InsertResponse(
                 status="success",
                 message="Text successfully inserted",
-                document_count=len(rag),
+                document_count=1,
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
