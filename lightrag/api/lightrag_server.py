@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Request
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import logging
 import argparse
@@ -20,6 +21,7 @@ import shutil
 import aiofiles
 from ascii_colors import trace_exception, ASCIIColors
 import os
+import configparser
 
 from fastapi import Depends, Security
 from fastapi.security import APIKeyHeader
@@ -56,6 +58,52 @@ LIGHTRAG_MODEL = f"{LIGHTRAG_NAME}:{LIGHTRAG_TAG}"
 LIGHTRAG_SIZE = 7365960935  # it's a dummy value
 LIGHTRAG_CREATED_AT = "2024-01-15T00:00:00Z"
 LIGHTRAG_DIGEST = "sha256:lightrag"
+
+KV_STORAGE = "JsonKVStorage"
+DOC_STATUS_STORAGE = "JsonDocStatusStorage"
+GRAPH_STORAGE = "NetworkXStorage"
+VECTOR_STORAGE = "NanoVectorDBStorage"
+
+# read config.ini
+config = configparser.ConfigParser()
+config.read("config.ini")
+# Redis config
+redis_uri = config.get("redis", "uri", fallback=None)
+if redis_uri:
+    os.environ["REDIS_URI"] = redis_uri
+    KV_STORAGE = "RedisKVStorage"
+    DOC_STATUS_STORAGE = "RedisKVStorage"
+
+# Neo4j config
+neo4j_uri = config.get("neo4j", "uri", fallback=None)
+neo4j_username = config.get("neo4j", "username", fallback=None)
+neo4j_password = config.get("neo4j", "password", fallback=None)
+if neo4j_uri:
+    os.environ["NEO4J_URI"] = neo4j_uri
+    os.environ["NEO4J_USERNAME"] = neo4j_username
+    os.environ["NEO4J_PASSWORD"] = neo4j_password
+    GRAPH_STORAGE = "Neo4JStorage"
+
+# Milvus config
+milvus_uri = config.get("milvus", "uri", fallback=None)
+milvus_user = config.get("milvus", "user", fallback=None)
+milvus_password = config.get("milvus", "password", fallback=None)
+milvus_db_name = config.get("milvus", "db_name", fallback=None)
+if milvus_uri:
+    os.environ["MILVUS_URI"] = milvus_uri
+    os.environ["MILVUS_USER"] = milvus_user
+    os.environ["MILVUS_PASSWORD"] = milvus_password
+    os.environ["MILVUS_DB_NAME"] = milvus_db_name
+    VECTOR_STORAGE = "MilvusVectorDBStorge"
+
+# MongoDB config
+mongo_uri = config.get("mongodb", "uri", fallback=None)
+mongo_database = config.get("mongodb", "LightRAG", fallback=None)
+if mongo_uri:
+    os.environ["MONGO_URI"] = mongo_uri
+    os.environ["MONGO_DATABASE"] = mongo_database
+    KV_STORAGE = "MongoKVStorage"
+    DOC_STATUS_STORAGE = "MongoKVStorage"
 
 
 def get_default_host(binding_type: str) -> str:
@@ -337,6 +385,18 @@ def parse_args() -> argparse.Namespace:
         help="Embedding model name (default: from env or bge-m3:latest)",
     )
 
+    parser.add_argument(
+        "--chunk_size",
+        default=1200,
+        help="chunk token size default 1200",
+    )
+
+    parser.add_argument(
+        "--chunk_overlap_size",
+        default=100,
+        help="chunk token size default 1200",
+    )
+
     def timeout_type(value):
         if value is None or value == "None":
             return None
@@ -407,9 +467,15 @@ def parse_args() -> argparse.Namespace:
         default=get_env_value("SSL_KEYFILE", None),
         help="Path to SSL private key file (required if --ssl is enabled)",
     )
+    parser.add_argument(
+        '--auto-scan-at-startup',
+        action='store_true',
+        default=False,
+        help='Enable automatic scanning when the program starts'
+    )
+
 
     args = parser.parse_args()
-    display_splash_screen(args)
 
     return args
 
@@ -467,6 +533,7 @@ class OllamaChatRequest(BaseModel):
     messages: List[OllamaMessage]
     stream: bool = True  # Default to streaming mode
     options: Optional[Dict[str, Any]] = None
+    system: Optional[str] = None
 
 
 class OllamaChatResponse(BaseModel):
@@ -474,6 +541,28 @@ class OllamaChatResponse(BaseModel):
     created_at: str
     message: OllamaMessage
     done: bool
+
+
+class OllamaGenerateRequest(BaseModel):
+    model: str = LIGHTRAG_MODEL
+    prompt: str
+    system: Optional[str] = None
+    stream: bool = False
+    options: Optional[Dict[str, Any]] = None
+
+
+class OllamaGenerateResponse(BaseModel):
+    model: str
+    created_at: str
+    response: str
+    done: bool
+    context: Optional[List[int]]
+    total_duration: Optional[int]
+    load_duration: Optional[int]
+    prompt_eval_count: Optional[int]
+    prompt_eval_duration: Optional[int]
+    eval_count: Optional[int]
+    eval_duration: Optional[int]
 
 
 class OllamaVersionResponse(BaseModel):
@@ -551,10 +640,17 @@ def get_api_key_dependency(api_key: Optional[str]):
 
 def create_app(args):
     # Verify that bindings arer correctly setup
-    if args.llm_binding not in ["lollms", "ollama", "openai"]:
+
+    if args.llm_binding not in [
+        "lollms",
+        "ollama",
+        "openai",
+        "openai-ollama",
+        "azure_openai",
+    ]:
         raise Exception("llm binding not supported")
 
-    if args.embedding_binding not in ["lollms", "ollama", "openai"]:
+    if args.embedding_binding not in ["lollms", "ollama", "openai", "azure_openai"]:
         raise Exception("embedding binding not supported")
 
     # Add SSL validation
@@ -692,22 +788,32 @@ def create_app(args):
     )
 
     # Initialize RAG
-    if args.llm_binding in ["lollms", "ollama"]:
+    if args.llm_binding in ["lollms", "ollama", "openai-ollama"]:
         rag = LightRAG(
             working_dir=args.working_dir,
             llm_model_func=lollms_model_complete
             if args.llm_binding == "lollms"
-            else ollama_model_complete,
+            else ollama_model_complete
+            if args.llm_binding == "ollama"
+            else openai_alike_model_complete,
             llm_model_name=args.llm_model,
             llm_model_max_async=args.max_async,
             llm_model_max_token_size=args.max_tokens,
+            chunk_token_size=int(args.chunk_size),
+            chunk_overlap_token_size=int(args.chunk_overlap_size),
             llm_model_kwargs={
                 "host": args.llm_binding_host,
                 "timeout": args.timeout,
                 "options": {"num_ctx": args.max_tokens},
                 "api_key": args.llm_binding_api_key,
-            },
+            }
+            if args.llm_binding == "lollms" or args.llm_binding == "ollama"
+            else {},
             embedding_func=embedding_func,
+            kv_storage=KV_STORAGE,
+            graph_storage=GRAPH_STORAGE,
+            vector_storage=VECTOR_STORAGE,
+            doc_status_storage=DOC_STATUS_STORAGE,
         )
     else:
         rag = LightRAG(
@@ -715,10 +821,16 @@ def create_app(args):
             llm_model_func=azure_openai_model_complete
             if args.llm_binding == "azure_openai"
             else openai_alike_model_complete,
+            chunk_token_size=int(args.chunk_size),
+            chunk_overlap_token_size=int(args.chunk_overlap_size),
             llm_model_name=args.llm_model,
             llm_model_max_async=args.max_async,
             llm_model_max_token_size=args.max_tokens,
             embedding_func=embedding_func,
+            kv_storage=KV_STORAGE,
+            graph_storage=GRAPH_STORAGE,
+            vector_storage=VECTOR_STORAGE,
+            doc_status_storage=DOC_STATUS_STORAGE,
         )
 
     async def index_file(file_path: Union[str, Path]) -> None:
@@ -799,22 +911,42 @@ def create_app(args):
     async def lifespan(app: FastAPI):
         """Lifespan context manager for startup and shutdown events"""
         # Startup logic
-        try:
-            new_files = doc_manager.scan_directory()
-            for file_path in new_files:
-                try:
-                    await index_file(file_path)
-                except Exception as e:
-                    trace_exception(e)
-                    logging.error(f"Error indexing file {file_path}: {str(e)}")
-
-            logging.info(f"Indexed {len(new_files)} documents from {args.input_dir}")
-        except Exception as e:
-            logging.error(f"Error during startup indexing: {str(e)}")
+        # Now only if this option is active, we can scan. This is better for big databases where there are hundreds of
+        # files. Makes the startup faster 
+        if args.auto_scan_at_startup:
+            ASCIIColors.info("Auto scan is active, rescanning the input directory.")
+            try:
+                new_files = doc_manager.scan_directory()
+                for file_path in new_files:
+                    try:
+                        await index_file(file_path)
+                    except Exception as e:
+                        trace_exception(e)
+                        logging.error(f"Error indexing file {file_path}: {str(e)}")
+    
+                logging.info(f"Indexed {len(new_files)} documents from {args.input_dir}")
+            except Exception as e:
+                logging.error(f"Error during startup indexing: {str(e)}")
 
     @app.post("/documents/scan", dependencies=[Depends(optional_api_key)])
     async def scan_for_new_documents():
-        """Manually trigger scanning for new documents"""
+        """
+        Manually trigger scanning for new documents in the directory managed by `doc_manager`.
+    
+        This endpoint facilitates manual initiation of a document scan to identify and index new files.
+        It processes all newly detected files, attempts indexing each file, logs any errors that occur,
+        and returns a summary of the operation.
+    
+        Returns:
+            dict: A dictionary containing:
+                - "status" (str): Indicates success or failure of the scanning process.
+                - "indexed_count" (int): The number of successfully indexed documents.
+                - "total_documents" (int): Total number of documents that have been indexed so far.
+    
+        Raises:
+            HTTPException: If an error occurs during the document scanning process, a 500 status
+                           code is returned with details about the exception.
+        """
         try:
             new_files = doc_manager.scan_directory()
             indexed_count = 0
@@ -836,7 +968,27 @@ def create_app(args):
 
     @app.post("/documents/upload", dependencies=[Depends(optional_api_key)])
     async def upload_to_input_dir(file: UploadFile = File(...)):
-        """Upload a file to the input directory"""
+        """
+        Endpoint for uploading a file to the input directory and indexing it.
+    
+        This API endpoint accepts a file through an HTTP POST request, checks if the 
+        uploaded file is of a supported type, saves it in the specified input directory,
+        indexes it for retrieval, and returns a success status with relevant details.
+    
+        Parameters:
+            file (UploadFile): The file to be uploaded. It must have an allowed extension as per
+                               `doc_manager.supported_extensions`.
+    
+        Returns:
+            dict: A dictionary containing the upload status ("success"), 
+                  a message detailing the operation result, and 
+                  the total number of indexed documents.
+    
+        Raises:
+            HTTPException: If the file type is not supported, it raises a 400 Bad Request error.
+                           If any other exception occurs during the file handling or indexing,
+                           it raises a 500 Internal Server Error with details about the exception.
+        """        
         try:
             if not doc_manager.is_supported_file(file.filename):
                 raise HTTPException(
@@ -863,6 +1015,25 @@ def create_app(args):
         "/query", response_model=QueryResponse, dependencies=[Depends(optional_api_key)]
     )
     async def query_text(request: QueryRequest):
+        """
+        Handle a POST request at the /query endpoint to process user queries using RAG capabilities.
+    
+        Parameters:
+            request (QueryRequest): A Pydantic model containing the following fields:
+                - query (str): The text of the user's query.
+                - mode (ModeEnum): Optional. Specifies the mode of retrieval augmentation.
+                - stream (bool): Optional. Determines if the response should be streamed.
+                - only_need_context (bool): Optional. If true, returns only the context without further processing.
+    
+        Returns:
+            QueryResponse: A Pydantic model containing the result of the query processing. 
+                           If a string is returned (e.g., cache hit), it's directly returned.
+                           Otherwise, an async generator may be used to build the response.
+    
+        Raises:
+            HTTPException: Raised when an error occurs during the request handling process,
+                           with status code 500 and detail containing the exception message.
+        """        
         try:
             response = await rag.aquery(
                 request.query,
@@ -894,6 +1065,16 @@ def create_app(args):
 
     @app.post("/query/stream", dependencies=[Depends(optional_api_key)])
     async def query_text_stream(request: QueryRequest):
+        """
+        This endpoint performs a retrieval-augmented generation (RAG) query and streams the response.
+
+        Args:
+            request (QueryRequest): The request object containing the query parameters.
+            optional_api_key (Optional[str], optional): An optional API key for authentication. Defaults to None.
+
+        Returns:
+            StreamingResponse: A streaming response containing the RAG query results.
+        """        
         try:
             response = await rag.aquery(  # Use aquery instead of query, and add await
                 request.query,
@@ -943,6 +1124,17 @@ def create_app(args):
         dependencies=[Depends(optional_api_key)],
     )
     async def insert_text(request: InsertTextRequest):
+        """
+        Insert text into the Retrieval-Augmented Generation (RAG) system.
+
+        This endpoint allows you to insert text data into the RAG system for later retrieval and use in generating responses.
+
+        Args:
+            request (InsertTextRequest): The request body containing the text to be inserted.
+
+        Returns:
+            InsertResponse: A response object containing the status of the operation, a message, and the number of documents inserted.
+        """        
         try:
             await rag.ainsert(request.text)
             return InsertResponse(
@@ -1176,6 +1368,15 @@ def create_app(args):
         dependencies=[Depends(optional_api_key)],
     )
     async def clear_documents():
+        """
+        Clear all documents from the LightRAG system.
+
+        This endpoint deletes all text chunks, entities vector database, and relationships vector database,
+        effectively clearing all documents from the LightRAG system.
+
+        Returns:
+            InsertResponse: A response object containing the status, message, and the new document count (0 in this case).
+        """
         try:
             rag.text_chunks = []
             rag.entities_vdb = None
@@ -1188,7 +1389,9 @@ def create_app(args):
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
+    # -------------------------------------------------
     # Ollama compatible API endpoints
+    # -------------------------------------------------
     @app.get("/api/version")
     async def get_version():
         """Get Ollama version information"""
@@ -1237,6 +1440,145 @@ def create_app(args):
 
         return query, SearchMode.hybrid
 
+    @app.post("/api/generate")
+    async def generate(raw_request: Request, request: OllamaGenerateRequest):
+        """Handle generate completion requests"""
+        try:
+            query = request.prompt
+            start_time = time.time_ns()
+            prompt_tokens = estimate_tokens(query)
+
+            if request.system:
+                rag.llm_model_kwargs["system_prompt"] = request.system
+
+            if request.stream:
+                from fastapi.responses import StreamingResponse
+
+                response = await rag.llm_model_func(
+                    query, stream=True, **rag.llm_model_kwargs
+                )
+
+                async def stream_generator():
+                    try:
+                        first_chunk_time = None
+                        last_chunk_time = None
+                        total_response = ""
+
+                        # Ensure response is an async generator
+                        if isinstance(response, str):
+                            # If it's a string, send in two parts
+                            first_chunk_time = time.time_ns()
+                            last_chunk_time = first_chunk_time
+                            total_response = response
+
+                            data = {
+                                "model": LIGHTRAG_MODEL,
+                                "created_at": LIGHTRAG_CREATED_AT,
+                                "response": response,
+                                "done": False,
+                            }
+                            yield f"{json.dumps(data, ensure_ascii=False)}\n"
+
+                            completion_tokens = estimate_tokens(total_response)
+                            total_time = last_chunk_time - start_time
+                            prompt_eval_time = first_chunk_time - start_time
+                            eval_time = last_chunk_time - first_chunk_time
+
+                            data = {
+                                "model": LIGHTRAG_MODEL,
+                                "created_at": LIGHTRAG_CREATED_AT,
+                                "done": True,
+                                "total_duration": total_time,
+                                "load_duration": 0,
+                                "prompt_eval_count": prompt_tokens,
+                                "prompt_eval_duration": prompt_eval_time,
+                                "eval_count": completion_tokens,
+                                "eval_duration": eval_time,
+                            }
+                            yield f"{json.dumps(data, ensure_ascii=False)}\n"
+                        else:
+                            async for chunk in response:
+                                if chunk:
+                                    if first_chunk_time is None:
+                                        first_chunk_time = time.time_ns()
+
+                                    last_chunk_time = time.time_ns()
+
+                                    total_response += chunk
+                                    data = {
+                                        "model": LIGHTRAG_MODEL,
+                                        "created_at": LIGHTRAG_CREATED_AT,
+                                        "response": chunk,
+                                        "done": False,
+                                    }
+                                    yield f"{json.dumps(data, ensure_ascii=False)}\n"
+
+                            completion_tokens = estimate_tokens(total_response)
+                            total_time = last_chunk_time - start_time
+                            prompt_eval_time = first_chunk_time - start_time
+                            eval_time = last_chunk_time - first_chunk_time
+
+                            data = {
+                                "model": LIGHTRAG_MODEL,
+                                "created_at": LIGHTRAG_CREATED_AT,
+                                "done": True,
+                                "total_duration": total_time,
+                                "load_duration": 0,
+                                "prompt_eval_count": prompt_tokens,
+                                "prompt_eval_duration": prompt_eval_time,
+                                "eval_count": completion_tokens,
+                                "eval_duration": eval_time,
+                            }
+                            yield f"{json.dumps(data, ensure_ascii=False)}\n"
+                            return
+
+                    except Exception as e:
+                        logging.error(f"Error in stream_generator: {str(e)}")
+                        raise
+
+                return StreamingResponse(
+                    stream_generator(),
+                    media_type="application/x-ndjson",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "Content-Type": "application/x-ndjson",
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Methods": "POST, OPTIONS",
+                        "Access-Control-Allow-Headers": "Content-Type",
+                    },
+                )
+            else:
+                first_chunk_time = time.time_ns()
+                response_text = await rag.llm_model_func(
+                    query, stream=False, **rag.llm_model_kwargs
+                )
+                last_chunk_time = time.time_ns()
+
+                if not response_text:
+                    response_text = "No response generated"
+
+                completion_tokens = estimate_tokens(str(response_text))
+                total_time = last_chunk_time - start_time
+                prompt_eval_time = first_chunk_time - start_time
+                eval_time = last_chunk_time - first_chunk_time
+
+                return {
+                    "model": LIGHTRAG_MODEL,
+                    "created_at": LIGHTRAG_CREATED_AT,
+                    "response": str(response_text),
+                    "done": True,
+                    "total_duration": total_time,
+                    "load_duration": 0,
+                    "prompt_eval_count": prompt_tokens,
+                    "prompt_eval_duration": prompt_eval_time,
+                    "eval_count": completion_tokens,
+                    "eval_duration": eval_time,
+                }
+        except Exception as e:
+            trace_exception(e)
+            raise HTTPException(status_code=500, detail=str(e))
+
     @app.post("/api/chat")
     async def chat(raw_request: Request, request: OllamaChatRequest):
         """Handle chat completion requests"""
@@ -1249,16 +1591,12 @@ def create_app(args):
             # Get the last message as query
             query = messages[-1].content
 
-            # 解析查询模式
+            # Check for query prefix
             cleaned_query, mode = parse_query_mode(query)
 
-            # 开始计时
             start_time = time.time_ns()
-
-            # 计算输入token数量
             prompt_tokens = estimate_tokens(cleaned_query)
 
-            # 调用RAG进行查询
             query_param = QueryParam(
                 mode=mode, stream=request.stream, only_need_context=False
             )
@@ -1369,7 +1707,21 @@ def create_app(args):
                 )
             else:
                 first_chunk_time = time.time_ns()
-                response_text = await rag.aquery(cleaned_query, param=query_param)
+
+                # Determine if the request is from Open WebUI's session title and session keyword generation task
+                match_result = re.search(
+                    r"\n<chat_history>\nUSER:", cleaned_query, re.MULTILINE
+                )
+                if match_result:
+                    if request.system:
+                        rag.llm_model_kwargs["system_prompt"] = request.system
+
+                    response_text = await rag.llm_model_func(
+                        cleaned_query, stream=False, **rag.llm_model_kwargs
+                    )
+                else:
+                    response_text = await rag.aquery(cleaned_query, param=query_param)
+
                 last_chunk_time = time.time_ns()
 
                 if not response_text:
@@ -1420,15 +1772,21 @@ def create_app(args):
                 "max_tokens": args.max_tokens,
             },
         }
+        
+    # Serve the static files
+    static_dir = Path(__file__).parent / "static"
+    static_dir.mkdir(exist_ok=True)
+    app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
 
     return app
 
-
+    
 def main():
     args = parse_args()
     import uvicorn
 
     app = create_app(args)
+    display_splash_screen(args)    
     uvicorn_config = {
         "app": app,
         "host": args.host,
