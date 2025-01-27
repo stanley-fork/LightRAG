@@ -4,6 +4,13 @@ from dataclasses import dataclass
 from typing import Union
 
 import numpy as np
+import pipmaster as pm
+
+if not pm.is_installed("pymysql"):
+    pm.install("pymysql")
+if not pm.is_installed("sqlalchemy"):
+    pm.install("sqlalchemy")
+
 from sqlalchemy import create_engine, text
 from tqdm import tqdm
 
