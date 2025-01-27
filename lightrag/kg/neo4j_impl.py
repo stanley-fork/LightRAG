@@ -339,3 +339,177 @@ class Neo4JStorage(BaseGraphStorage):
 
     async def _node2vec_embed(self):
         print("Implemented but never called.")
+
+    async def get_knowledge_graph(
+        self, node_label: str, max_depth: int = 5
+    ) -> Dict[str, List[Dict]]:
+        """
+        Get complete connected subgraph for specified node (including the starting node itself)
+
+        Key fixes:
+        1. Include the starting node itself
+        2. Handle multi-label nodes
+        3. Clarify relationship directions
+        4. Add depth control
+        """
+        label = node_label.strip('"')
+        result = {"nodes": [], "edges": []}
+        seen_nodes = set()
+        seen_edges = set()
+
+        async with self._driver.session(database=self._DATABASE) as session:
+            try:
+                # Critical debug step: first verify if starting node exists
+                validate_query = f"MATCH (n:`{label}`) RETURN n LIMIT 1"
+                validate_result = await session.run(validate_query)
+                if not await validate_result.single():
+                    logger.warning(f"Starting node {label} does not exist!")
+                    return result
+
+                # Optimized query (including direction handling and self-loops)
+                main_query = f"""
+                MATCH (start:`{label}`)
+                WITH start
+                CALL apoc.path.subgraphAll(start, {{
+                    relationshipFilter: '>',
+                    minLevel: 0,
+                    maxLevel: {max_depth},
+                    bfs: true
+                }})
+                YIELD nodes, relationships
+                RETURN nodes, relationships
+                """
+                result_set = await session.run(main_query)
+                record = await result_set.single()
+
+                if record:
+                    # Handle nodes (compatible with multi-label cases)
+                    for node in record["nodes"]:
+                        # Use node ID + label combination as unique identifier
+                        node_id = f"{node.id}_{'_'.join(node.labels)}"
+                        if node_id not in seen_nodes:
+                            node_data = dict(node)
+                            node_data["labels"] = list(node.labels)  # Keep all labels
+                            result["nodes"].append(node_data)
+                            seen_nodes.add(node_id)
+
+                    # Handle relationships (including direction information)
+                    for rel in record["relationships"]:
+                        edge_id = f"{rel.id}_{rel.type}"
+                        if edge_id not in seen_edges:
+                            start = rel.start_node
+                            end = rel.end_node
+                            edge_data = dict(rel)
+                            edge_data.update(
+                                {
+                                    "source": f"{start.id}_{'_'.join(start.labels)}",
+                                    "target": f"{end.id}_{'_'.join(end.labels)}",
+                                    "type": rel.type,
+                                    "direction": rel.element_id.split(
+                                        "->" if rel.end_node == end else "<-"
+                                    )[1],
+                                }
+                            )
+                            result["edges"].append(edge_data)
+                            seen_edges.add(edge_id)
+
+                    logger.info(
+                        f"Subgraph query successful | Node count: {len(result['nodes'])} | Edge count: {len(result['edges'])}"
+                    )
+
+            except neo4jExceptions.ClientError as e:
+                logger.error(f"APOC query failed: {str(e)}")
+                return await self._robust_fallback(label, max_depth)
+
+        return result
+
+    async def _robust_fallback(
+        self, label: str, max_depth: int
+    ) -> Dict[str, List[Dict]]:
+        """Enhanced fallback query solution"""
+        result = {"nodes": [], "edges": []}
+        visited_nodes = set()
+        visited_edges = set()
+
+        async def traverse(current_label: str, current_depth: int):
+            if current_depth > max_depth:
+                return
+
+            # Get current node details
+            node = await self.get_node(current_label)
+            if not node:
+                return
+
+            node_id = f"{current_label}"
+            if node_id in visited_nodes:
+                return
+            visited_nodes.add(node_id)
+
+            # Add node data (with complete labels)
+            node_data = {k: v for k, v in node.items()}
+            node_data["labels"] = [
+                current_label
+            ]  # Assume get_node method returns label information
+            result["nodes"].append(node_data)
+
+            # Get all outgoing and incoming edges
+            query = f"""
+            MATCH (a)-[r]-(b)
+            WHERE a:`{current_label}` OR b:`{current_label}`
+            RETURN a, r, b,
+                   CASE WHEN startNode(r) = a THEN 'OUTGOING' ELSE 'INCOMING' END AS direction
+            """
+            async with self._driver.session(database=self._DATABASE) as session:
+                results = await session.run(query)
+                async for record in results:
+                    # Handle edges
+                    rel = record["r"]
+                    edge_id = f"{rel.id}_{rel.type}"
+                    if edge_id not in visited_edges:
+                        edge_data = dict(rel)
+                        edge_data.update(
+                            {
+                                "source": list(record["a"].labels)[0],
+                                "target": list(record["b"].labels)[0],
+                                "type": rel.type,
+                                "direction": record["direction"],
+                            }
+                        )
+                        result["edges"].append(edge_data)
+                        visited_edges.add(edge_id)
+
+                        # Recursively traverse adjacent nodes
+                        next_label = (
+                            list(record["b"].labels)[0]
+                            if record["direction"] == "OUTGOING"
+                            else list(record["a"].labels)[0]
+                        )
+                        await traverse(next_label, current_depth + 1)
+
+        await traverse(label, 0)
+        return result
+
+    async def get_all_labels(self) -> List[str]:
+        """
+        Get all existing node labels in the database
+        Returns:
+            ["Person", "Company", ...]  # Alphabetically sorted label list
+        """
+        async with self._driver.session(database=self._DATABASE) as session:
+            # Method 1: Direct metadata query (Available for Neo4j 4.3+)
+            # query = "CALL db.labels() YIELD label RETURN label"
+
+            # Method 2: Query compatible with older versions
+            query = """
+                MATCH (n)
+                WITH DISTINCT labels(n) AS node_labels
+                UNWIND node_labels AS label
+                RETURN DISTINCT label
+                ORDER BY label
+            """
+
+            result = await session.run(query)
+            labels = []
+            async for record in result:
+                labels.append(record["label"])
+            return labels

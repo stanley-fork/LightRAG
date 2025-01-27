@@ -574,6 +574,7 @@ async def kg_query(
     query_param: QueryParam,
     global_config: dict,
     hashing_kv: BaseKVStorage = None,
+    prompt: str = "",
 ) -> str:
     # Handle cache
     use_model_func = global_config["llm_model_func"]
@@ -633,14 +634,11 @@ async def kg_query(
     # Process conversation history
     history_context = ""
     if query_param.conversation_history:
-        recent_history = query_param.conversation_history[
-            -query_param.history_window_size :
-        ]
-        history_context = "\n".join(
-            [f"{turn['role']}: {turn['content']}" for turn in recent_history]
+        history_context = get_conversation_turns(
+            query_param.conversation_history, query_param.history_turns
         )
 
-    sys_prompt_temp = PROMPTS["rag_response"]
+    sys_prompt_temp = prompt if prompt else PROMPTS["rag_response"]
     sys_prompt = sys_prompt_temp.format(
         context_data=context,
         response_type=query_param.response_type,
