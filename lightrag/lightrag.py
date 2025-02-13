@@ -1,5 +1,6 @@
 import asyncio
 import os
+import configparser
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from functools import partial
@@ -34,17 +35,123 @@ from .utils import (
     logger,
     set_logger,
 )
+from .types import KnowledgeGraph
 
+config = configparser.ConfigParser()
+config.read("config.ini", "utf-8")
+
+# Storage type and implementation compatibility validation table
+STORAGE_IMPLEMENTATIONS = {
+    "KV_STORAGE": {
+        "implementations": [
+            "JsonKVStorage",
+            "MongoKVStorage",
+            "RedisKVStorage",
+            "TiDBKVStorage",
+            "PGKVStorage",
+            "OracleKVStorage",
+        ],
+        "required_methods": ["get_by_id", "upsert"],
+    },
+    "GRAPH_STORAGE": {
+        "implementations": [
+            "NetworkXStorage",
+            "Neo4JStorage",
+            "MongoGraphStorage",
+            "TiDBGraphStorage",
+            "AGEStorage",
+            "GremlinStorage",
+            "PGGraphStorage",
+            "OracleGraphStorage",
+        ],
+        "required_methods": ["upsert_node", "upsert_edge"],
+    },
+    "VECTOR_STORAGE": {
+        "implementations": [
+            "NanoVectorDBStorage",
+            "MilvusVectorDBStorge",
+            "ChromaVectorDBStorage",
+            "TiDBVectorDBStorage",
+            "PGVectorStorage",
+            "FaissVectorDBStorage",
+            "QdrantVectorDBStorage",
+            "OracleVectorDBStorage",
+        ],
+        "required_methods": ["query", "upsert"],
+    },
+    "DOC_STATUS_STORAGE": {
+        "implementations": ["JsonDocStatusStorage", "PGDocStatusStorage"],
+        "required_methods": ["get_pending_docs"],
+    },
+}
+
+# Storage implementation environment variable without default value
+STORAGE_ENV_REQUIREMENTS = {
+    # KV Storage Implementations
+    "JsonKVStorage": [],
+    "MongoKVStorage": [],
+    "RedisKVStorage": ["REDIS_URI"],
+    "TiDBKVStorage": ["TIDB_USER", "TIDB_PASSWORD", "TIDB_DATABASE"],
+    "PGKVStorage": ["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DATABASE"],
+    "OracleKVStorage": [
+        "ORACLE_DSN",
+        "ORACLE_USER",
+        "ORACLE_PASSWORD",
+        "ORACLE_CONFIG_DIR",
+    ],
+    # Graph Storage Implementations
+    "NetworkXStorage": [],
+    "Neo4JStorage": ["NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD"],
+    "MongoGraphStorage": [],
+    "TiDBGraphStorage": ["TIDB_USER", "TIDB_PASSWORD", "TIDB_DATABASE"],
+    "AGEStorage": [
+        "AGE_POSTGRES_DB",
+        "AGE_POSTGRES_USER",
+        "AGE_POSTGRES_PASSWORD",
+    ],
+    "GremlinStorage": ["GREMLIN_HOST", "GREMLIN_PORT", "GREMLIN_GRAPH"],
+    "PGGraphStorage": [
+        "POSTGRES_USER",
+        "POSTGRES_PASSWORD",
+        "POSTGRES_DATABASE",
+    ],
+    "OracleGraphStorage": [
+        "ORACLE_DSN",
+        "ORACLE_USER",
+        "ORACLE_PASSWORD",
+        "ORACLE_CONFIG_DIR",
+    ],
+    # Vector Storage Implementations
+    "NanoVectorDBStorage": [],
+    "MilvusVectorDBStorge": [],
+    "ChromaVectorDBStorage": [],
+    "TiDBVectorDBStorage": ["TIDB_USER", "TIDB_PASSWORD", "TIDB_DATABASE"],
+    "PGVectorStorage": ["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DATABASE"],
+    "FaissVectorDBStorage": [],
+    "QdrantVectorDBStorage": ["QDRANT_URL"],  # QDRANT_API_KEY has default value None
+    "OracleVectorDBStorage": [
+        "ORACLE_DSN",
+        "ORACLE_USER",
+        "ORACLE_PASSWORD",
+        "ORACLE_CONFIG_DIR",
+    ],
+    # Document Status Storage Implementations
+    "JsonDocStatusStorage": [],
+    "PGDocStatusStorage": ["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DATABASE"],
+    "MongoDocStatusStorage": [],
+}
+
+# Storage implementation module mapping
 STORAGES = {
     "NetworkXStorage": ".kg.networkx_impl",
     "JsonKVStorage": ".kg.json_kv_impl",
     "NanoVectorDBStorage": ".kg.nano_vector_db_impl",
-    "JsonDocStatusStorage": ".kg.jsondocstatus_impl",
+    "JsonDocStatusStorage": ".kg.json_doc_status_impl",
     "Neo4JStorage": ".kg.neo4j_impl",
     "OracleKVStorage": ".kg.oracle_impl",
     "OracleGraphStorage": ".kg.oracle_impl",
     "OracleVectorDBStorage": ".kg.oracle_impl",
-    "MilvusVectorDBStorge": ".kg.milvus_impl",
+    "MilvusVectorDBStorage": ".kg.milvus_impl",
     "MongoKVStorage": ".kg.mongo_impl",
     "MongoDocStatusStorage": ".kg.mongo_impl",
     "MongoGraphStorage": ".kg.mongo_impl",
@@ -138,6 +245,9 @@ class LightRAG:
 
     graph_storage: str = field(default="NetworkXStorage")
     """Storage backend for knowledge graphs."""
+
+    doc_status_storage: str = field(default="JsonDocStatusStorage")
+    """Storage type for tracking document processing statuses."""
 
     # Logging
     current_log_level = logger.level
@@ -235,9 +345,6 @@ class LightRAG:
         convert_response_to_json
     )
 
-    doc_status_storage: str = field(default="JsonDocStatusStorage")
-    """Storage type for tracking document processing statuses."""
-
     # Custom Chunking Function
     chunking_func: Callable[
         [
@@ -251,6 +358,46 @@ class LightRAG:
         list[dict[str, Any]],
     ] = chunking_by_token_size
 
+    def verify_storage_implementation(
+        self, storage_type: str, storage_name: str
+    ) -> None:
+        """Verify if storage implementation is compatible with specified storage type
+
+        Args:
+            storage_type: Storage type (KV_STORAGE, GRAPH_STORAGE etc.)
+            storage_name: Storage implementation name
+
+        Raises:
+            ValueError: If storage implementation is incompatible or missing required methods
+        """
+        if storage_type not in STORAGE_IMPLEMENTATIONS:
+            raise ValueError(f"Unknown storage type: {storage_type}")
+
+        storage_info = STORAGE_IMPLEMENTATIONS[storage_type]
+        if storage_name not in storage_info["implementations"]:
+            raise ValueError(
+                f"Storage implementation '{storage_name}' is not compatible with {storage_type}. "
+                f"Compatible implementations are: {', '.join(storage_info['implementations'])}"
+            )
+
+    def check_storage_env_vars(self, storage_name: str) -> None:
+        """Check if all required environment variables for storage implementation exist
+
+        Args:
+            storage_name: Storage implementation name
+
+        Raises:
+            ValueError: If required environment variables are missing
+        """
+        required_vars = STORAGE_ENV_REQUIREMENTS.get(storage_name, [])
+        missing_vars = [var for var in required_vars if var not in os.environ]
+
+        if missing_vars:
+            raise ValueError(
+                f"Storage implementation '{storage_name}' requires the following "
+                f"environment variables: {', '.join(missing_vars)}"
+            )
+
     def __post_init__(self):
         os.makedirs(self.log_dir, exist_ok=True)
         log_file = os.path.join(self.log_dir, "lightrag.log")
@@ -261,6 +408,29 @@ class LightRAG:
         if not os.path.exists(self.working_dir):
             logger.info(f"Creating working directory {self.working_dir}")
             os.makedirs(self.working_dir)
+
+        # Verify storage implementation compatibility and environment variables
+        storage_configs = [
+            ("KV_STORAGE", self.kv_storage),
+            ("VECTOR_STORAGE", self.vector_storage),
+            ("GRAPH_STORAGE", self.graph_storage),
+            ("DOC_STATUS_STORAGE", self.doc_status_storage),
+        ]
+
+        for storage_type, storage_name in storage_configs:
+            # Verify storage implementation compatibility
+            self.verify_storage_implementation(storage_type, storage_name)
+            # Check environment variables
+            self.check_storage_env_vars(storage_name)
+
+        # Ensure vector_db_storage_cls_kwargs has required fields
+        default_vector_db_kwargs = {
+            "cosine_better_than_threshold": float(os.getenv("COSINE_THRESHOLD", "0.2"))
+        }
+        self.vector_db_storage_cls_kwargs = {
+            **default_vector_db_kwargs,
+            **self.vector_db_storage_cls_kwargs,
+        }
 
         # show config
         global_config = asdict(self)
@@ -295,10 +465,8 @@ class LightRAG:
             self.graph_storage_cls, global_config=global_config
         )
 
-        self.json_doc_status_storage = self.key_string_value_json_storage_cls(
-            namespace=self.namespace_prefix + "json_doc_status_storage",
-            embedding_func=None,
-        )
+        # Initialize document status storage
+        self.doc_status_storage_cls = self._get_storage_class(self.doc_status_storage)
 
         self.llm_response_cache = self.key_string_value_json_storage_cls(
             namespace=make_namespace(
@@ -307,9 +475,6 @@ class LightRAG:
             embedding_func=self.embedding_func,
         )
 
-        ####
-        # add embedding func by walter
-        ####
         self.full_docs: BaseKVStorage = self.key_string_value_json_storage_cls(
             namespace=make_namespace(
                 self.namespace_prefix, NameSpace.KV_STORE_FULL_DOCS
@@ -328,9 +493,6 @@ class LightRAG:
             ),
             embedding_func=self.embedding_func,
         )
-        ####
-        # add embedding func by walter over
-        ####
 
         self.entities_vdb = self.vector_db_storage_cls(
             namespace=make_namespace(
@@ -353,6 +515,14 @@ class LightRAG:
             embedding_func=self.embedding_func,
         )
 
+        # Initialize document status storage
+        self.doc_status: DocStatusStorage = self.doc_status_storage_cls(
+            namespace=make_namespace(self.namespace_prefix, NameSpace.DOC_STATUS),
+            global_config=global_config,
+            embedding_func=None,
+        )
+
+        # What's for, Is this nessisary ?
         if self.llm_response_cache and hasattr(
             self.llm_response_cache, "global_config"
         ):
@@ -373,19 +543,13 @@ class LightRAG:
             )
         )
 
-        # Initialize document status storage
-        self.doc_status_storage_cls = self._get_storage_class(self.doc_status_storage)
-        self.doc_status: DocStatusStorage = self.doc_status_storage_cls(
-            namespace=make_namespace(self.namespace_prefix, NameSpace.DOC_STATUS),
-            global_config=global_config,
-            embedding_func=None,
-        )
-
     async def get_graph_labels(self):
         text = await self.chunk_entity_relation_graph.get_all_labels()
         return text
 
-    async def get_graps(self, nodel_label: str, max_depth: int):
+    async def get_knowledge_graph(
+        self, nodel_label: str, max_depth: int
+    ) -> KnowledgeGraph:
         return await self.chunk_entity_relation_graph.get_knowledge_graph(
             node_label=nodel_label, max_depth=max_depth
         )
@@ -396,7 +560,8 @@ class LightRAG:
         return storage_class
 
     def set_storage_client(self, db_client):
-        # Now only tested on Oracle Database
+        # Deprecated, seting correct value to *_storage of LightRAG insteaded
+        # Inject db to storage implementation (only tested on Oracle Database)
         for storage in [
             self.vector_db_storage_cls,
             self.graph_storage_cls,
