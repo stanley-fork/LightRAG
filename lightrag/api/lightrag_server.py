@@ -6,7 +6,7 @@ from fastapi import (
     Form,
     BackgroundTasks,
 )
-
+import asyncio
 import threading
 import os
 import json
@@ -100,6 +100,7 @@ def estimate_tokens(text: str) -> int:
     tokens = chinese_chars * 1.5 + non_chinese_chars * 0.25
 
     return int(tokens)
+
 
 def get_default_host(binding_type: str) -> str:
     default_hosts = {
@@ -246,11 +247,11 @@ def display_splash_screen(args: argparse.Namespace) -> None:
         ASCIIColors.yellow(f"{protocol}://<your-ip-address>:{args.port}")
         ASCIIColors.white("    ├─ API Documentation (local): ", end="")
         ASCIIColors.yellow(f"{protocol}://localhost:{args.port}/docs")
-        ASCIIColors.white("    └─ Alternative Documentation (local): ", end="")
+        ASCIIColors.white("    ├─ Alternative Documentation (local): ", end="")
         ASCIIColors.yellow(f"{protocol}://localhost:{args.port}/redoc")
         ASCIIColors.white("    ├─ WebUI (local): ", end="")
         ASCIIColors.yellow(f"{protocol}://localhost:{args.port}/webui")
-        ASCIIColors.white("    ├─ Graph Viewer (local): ", end="")
+        ASCIIColors.white("    └─ Graph Viewer (local): ", end="")
         ASCIIColors.yellow(f"{protocol}://localhost:{args.port}/graph-viewer")
 
         ASCIIColors.yellow("\n📝 Note:")
@@ -729,6 +730,8 @@ def create_app(args):
         postgres_db = None
         oracle_db = None
         tidb_db = None
+        # Store background tasks
+        app.state.background_tasks = set()
 
         try:
             # Check if PostgreSQL is needed
@@ -793,20 +796,23 @@ def create_app(args):
 
             # Auto scan documents if enabled
             if args.auto_scan_at_startup:
-                try:
-                    new_files = doc_manager.scan_directory_for_new_files()
-                    for file_path in new_files:
-                        try:
-                            await index_file(file_path)
-                        except Exception as e:
-                            trace_exception(e)
-                            logging.error(f"Error indexing file {file_path}: {str(e)}")
-
-                    ASCIIColors.info(
-                        f"Indexed {len(new_files)} documents from {args.input_dir}"
-                    )
-                except Exception as e:
-                    logging.error(f"Error during startup indexing: {str(e)}")
+                # Start scanning in background
+                with progress_lock:
+                    if not scan_progress["is_scanning"]:
+                        scan_progress["is_scanning"] = True
+                        scan_progress["indexed_count"] = 0
+                        scan_progress["progress"] = 0
+                        # Create background task
+                        task = asyncio.create_task(run_scanning_process())
+                        app.state.background_tasks.add(task)
+                        task.add_done_callback(app.state.background_tasks.discard)
+                        ASCIIColors.info(
+                            f"Started background scanning of documents from {args.input_dir}"
+                        )
+                    else:
+                        ASCIIColors.info(
+                            "Skip document scanning(anohter scanning is active)"
+                        )
 
             yield
 
@@ -1021,7 +1027,8 @@ def create_app(args):
         if args.embedding_binding == "azure_openai"
         else openai_embed(
             texts,
-            model=args.embedding_model,  # no host is used for openai,
+            model=args.embedding_model,
+            base_url=args.embedding_binding_host,
             api_key=args.embedding_binding_api_key,
         ),
     )
@@ -1144,9 +1151,15 @@ def create_app(args):
                     pm.install("docling")
                 from docling.document_converter import DocumentConverter
 
-                converter = DocumentConverter()
-                result = converter.convert(file_path)
-                content = result.document.export_to_markdown()
+                async def convert_doc():
+                    def sync_convert():
+                        converter = DocumentConverter()
+                        result = converter.convert(file_path)
+                        return result.document.export_to_markdown()
+
+                    return await asyncio.to_thread(sync_convert)
+
+                content = await convert_doc()
 
             case _:
                 raise ValueError(f"Unsupported file format: {ext}")
@@ -1438,9 +1451,16 @@ def create_app(args):
                         f.write(await file.read())
 
                     try:
-                        converter = DocumentConverter()
-                        result = converter.convert(str(temp_path))
-                        content = result.document.export_to_markdown()
+
+                        async def convert_doc():
+                            def sync_convert():
+                                converter = DocumentConverter()
+                                result = converter.convert(str(temp_path))
+                                return result.document.export_to_markdown()
+
+                            return await asyncio.to_thread(sync_convert)
+
+                        content = await convert_doc()
                     finally:
                         # Clean up the temporary file
                         temp_path.unlink()

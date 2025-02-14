@@ -69,7 +69,7 @@ STORAGE_IMPLEMENTATIONS = {
     "VECTOR_STORAGE": {
         "implementations": [
             "NanoVectorDBStorage",
-            "MilvusVectorDBStorge",
+            "MilvusVectorDBStorage",
             "ChromaVectorDBStorage",
             "TiDBVectorDBStorage",
             "PGVectorStorage",
@@ -80,7 +80,12 @@ STORAGE_IMPLEMENTATIONS = {
         "required_methods": ["query", "upsert"],
     },
     "DOC_STATUS_STORAGE": {
-        "implementations": ["JsonDocStatusStorage", "PGDocStatusStorage"],
+        "implementations": [
+            "JsonDocStatusStorage",
+            "PGDocStatusStorage",
+            "PGDocStatusStorage",
+            "MongoDocStatusStorage",
+        ],
         "required_methods": ["get_pending_docs"],
     },
 }
@@ -123,7 +128,7 @@ STORAGE_ENV_REQUIREMENTS = {
     ],
     # Vector Storage Implementations
     "NanoVectorDBStorage": [],
-    "MilvusVectorDBStorge": [],
+    "MilvusVectorDBStorage": [],
     "ChromaVectorDBStorage": [],
     "TiDBVectorDBStorage": ["TIDB_USER", "TIDB_PASSWORD", "TIDB_DATABASE"],
     "PGVectorStorage": ["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DATABASE"],
@@ -421,7 +426,7 @@ class LightRAG:
             # Verify storage implementation compatibility
             self.verify_storage_implementation(storage_type, storage_name)
             # Check environment variables
-            self.check_storage_env_vars(storage_name)
+            # self.check_storage_env_vars(storage_name)
 
         # Ensure vector_db_storage_cls_kwargs has required fields
         default_vector_db_kwargs = {
@@ -1259,7 +1264,7 @@ class LightRAG:
         """
         try:
             # 1. Get the document status and related data
-            doc_status = await self.doc_status.get(doc_id)
+            doc_status = await self.doc_status.get_by_id(doc_id)
             if not doc_status:
                 logger.warning(f"Document {doc_id} not found")
                 return
@@ -1267,9 +1272,7 @@ class LightRAG:
             logger.debug(f"Starting deletion for document {doc_id}")
 
             # 2. Get all related chunks
-            chunks = await self.text_chunks.filter(
-                lambda x: x.get("full_doc_id") == doc_id
-            )
+            chunks = await self.text_chunks.get_by_id(doc_id)
             chunk_ids = list(chunks.keys())
             logger.debug(f"Found {len(chunk_ids)} chunks to delete")
 
@@ -1405,9 +1408,7 @@ class LightRAG:
                     logger.error(f"Document {doc_id} still exists in full_docs")
 
                 # Verify if chunks have been deleted
-                remaining_chunks = await self.text_chunks.filter(
-                    lambda x: x.get("full_doc_id") == doc_id
-                )
+                remaining_chunks = await self.text_chunks.get_by_id(doc_id)
                 if remaining_chunks:
                     logger.error(f"Found {len(remaining_chunks)} remaining chunks")
 
