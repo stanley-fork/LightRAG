@@ -169,10 +169,6 @@ class MongoDocStatusStorage(DocStatusStorage):
             )
         await asyncio.gather(*update_tasks)
 
-    async def drop(self) -> None:
-        """Drop the collection"""
-        await self._data.drop()
-
     async def get_status_counts(self) -> dict[str, int]:
         """Get counts of documents in each status"""
         pipeline = [{"$group": {"_id": "$status", "count": {"$sum": 1}}}]
@@ -205,6 +201,10 @@ class MongoDocStatusStorage(DocStatusStorage):
     async def index_done_callback(self) -> None:
         # Mongo handles persistence automatically
         pass
+
+    async def drop(self) -> None:
+        """Drop the collection"""
+        await self._data.drop()
 
 
 @final
