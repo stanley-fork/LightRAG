@@ -1,3 +1,4 @@
+aiofiles
 ascii_colors
 fastapi
 numpy
@@ -6,6 +7,4 @@ python-dotenv
 python-multipart
 tenacity
 tiktoken
-torch
-tqdm
 uvicorn
