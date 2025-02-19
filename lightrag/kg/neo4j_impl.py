@@ -23,18 +23,13 @@ import pipmaster as pm
 if not pm.is_installed("neo4j"):
     pm.install("neo4j")
 
-try:
-    from neo4j import (
-        AsyncGraphDatabase,
-        exceptions as neo4jExceptions,
-        AsyncDriver,
-        AsyncManagedTransaction,
-        GraphDatabase,
-    )
-except ImportError as e:
-    raise ImportError(
-        "`neo4j` library is not installed. Please install it via pip: `pip install neo4j`."
-    ) from e
+from neo4j import (
+    AsyncGraphDatabase,
+    exceptions as neo4jExceptions,
+    AsyncDriver,
+    AsyncManagedTransaction,
+    GraphDatabase,
+)
 
 config = configparser.ConfigParser()
 config.read("config.ini", "utf-8")
@@ -43,10 +38,6 @@ config.read("config.ini", "utf-8")
 @final
 @dataclass
 class Neo4JStorage(BaseGraphStorage):
-    @staticmethod
-    def load_nx_graph(file_name):
-        print("no preloading of graph with neo4j in production")
-
     def __init__(self, namespace, global_config, embedding_func):
         super().__init__(
             namespace=namespace,
