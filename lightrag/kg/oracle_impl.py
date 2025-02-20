@@ -8,6 +8,7 @@ from typing import Any, Union, final
 import numpy as np
 import configparser
 
+from lightrag.types import KnowledgeGraph
 
 from ..base import (
     BaseGraphStorage,
@@ -44,7 +45,7 @@ class OracleDB:
         self.increment = 1
         logger.info(f"Using the label {self.workspace} for Oracle Graph as identifier")
         if self.user is None or self.password is None:
-            raise ValueError("Missing database user or password in addon_params")
+            raise ValueError("Missing database user or password")
 
         try:
             oracledb.defaults.fetch_lobs = False
@@ -667,6 +668,14 @@ class OracleGraphStorage(BaseGraphStorage):
             return res
 
     async def delete_node(self, node_id: str) -> None:
+        raise NotImplementedError
+
+    async def get_all_labels(self) -> list[str]:
+        raise NotImplementedError
+
+    async def get_knowledge_graph(
+        self, node_label: str, max_depth: int = 5
+    ) -> KnowledgeGraph:
         raise NotImplementedError
 
 

@@ -7,6 +7,7 @@ from typing import Any, Union, final
 import numpy as np
 import configparser
 
+from lightrag.types import KnowledgeGraph
 
 import sys
 from tenacity import (
@@ -54,9 +55,7 @@ class PostgreSQLDB:
         self.pool: Pool | None = None
 
         if self.user is None or self.password is None or self.database is None:
-            raise ValueError(
-                "Missing database user, password, or database in addon_params"
-            )
+            raise ValueError("Missing database user, password, or database")
 
     async def initdb(self):
         try:
@@ -179,10 +178,12 @@ class PostgreSQLDB:
             asyncpg.exceptions.UniqueViolationError,
             asyncpg.exceptions.DuplicateTableError,
         ) as e:
-            if not upsert:
-                logger.error(f"PostgreSQL, upsert error: {e}")
+            if upsert:
+                print("Key value duplicate, but upsert succeeded.")
+            else:
+                logger.error(f"Upsert error: {e}")
         except Exception as e:
-            logger.error(f"PostgreSQL database, sql:{sql}, data:{data}, error:{e}")
+            logger.error(f"PostgreSQL database,\nsql:{sql},\ndata:{data},\nerror:{e}")
             raise
 
 
@@ -1084,6 +1085,14 @@ class PGGraphStorage(BaseGraphStorage):
     async def embed_nodes(
         self, algorithm: str
     ) -> tuple[np.ndarray[Any, Any], list[str]]:
+        raise NotImplementedError
+
+    async def get_all_labels(self) -> list[str]:
+        raise NotImplementedError
+
+    async def get_knowledge_graph(
+        self, node_label: str, max_depth: int = 5
+    ) -> KnowledgeGraph:
         raise NotImplementedError
 
     async def drop(self) -> None:
