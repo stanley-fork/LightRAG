@@ -7,7 +7,6 @@ from typing import Any, Union, final
 import numpy as np
 import configparser
 
-from lightrag.types import KnowledgeGraph
 
 import sys
 from tenacity import (
@@ -38,14 +37,8 @@ import pipmaster as pm
 if not pm.is_installed("asyncpg"):
     pm.install("asyncpg")
 
-try:
-    import asyncpg
-    from asyncpg import Pool
-
-except ImportError as e:
-    raise ImportError(
-        "`asyncpg` library is not installed. Please install it via pip: `pip install asyncpg`."
-    ) from e
+import asyncpg
+from asyncpg import Pool
 
 
 class PostgreSQLDB:
@@ -186,12 +179,10 @@ class PostgreSQLDB:
             asyncpg.exceptions.UniqueViolationError,
             asyncpg.exceptions.DuplicateTableError,
         ) as e:
-            if upsert:
-                print("Key value duplicate, but upsert succeeded.")
-            else:
-                logger.error(f"Upsert error: {e}")
+            if not upsert:
+                logger.error(f"PostgreSQL, upsert error: {e}")
         except Exception as e:
-            logger.error(f"PostgreSQL database,\nsql:{sql},\ndata:{data},\nerror:{e}")
+            logger.error(f"PostgreSQL database, sql:{sql}, data:{data}, error:{e}")
             raise
 
 
@@ -353,6 +344,10 @@ class PGKVStorage(BaseKVStorage):
 
     ################ INSERT METHODS ################
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
+        logger.info(f"Inserting {len(data)} to {self.namespace}")
+        if not data:
+            return
+
         if is_namespace(self.namespace, NameSpace.KV_STORE_TEXT_CHUNKS):
             pass
         elif is_namespace(self.namespace, NameSpace.KV_STORE_FULL_DOCS):
@@ -454,10 +449,10 @@ class PGVectorStorage(BaseVectorStorage):
         return upsert_sql, data
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
-        logger.info(f"Inserting {len(data)} vectors to {self.namespace}")
-        if not len(data):
-            logger.warning("You insert an empty data to vector DB")
-            return []
+        logger.info(f"Inserting {len(data)} to {self.namespace}")
+        if not data:
+            return
+
         current_time = time.time()
         list_data = [
             {
@@ -618,6 +613,10 @@ class PGDocStatusStorage(DocStatusStorage):
         Args:
             data: dictionary of document IDs and their status data
         """
+        logger.info(f"Inserting {len(data)} to {self.namespace}")
+        if not data:
+            return
+
         sql = """insert into LIGHTRAG_DOC_STATUS(workspace,id,content,content_summary,content_length,chunks_count,status)
                  values($1,$2,$3,$4,$5,$6,$7)
                   on conflict(id,workspace) do update set
@@ -1085,14 +1084,6 @@ class PGGraphStorage(BaseGraphStorage):
     async def embed_nodes(
         self, algorithm: str
     ) -> tuple[np.ndarray[Any, Any], list[str]]:
-        raise NotImplementedError
-
-    async def get_all_labels(self) -> list[str]:
-        raise NotImplementedError
-
-    async def get_knowledge_graph(
-        self, node_label: str, max_depth: int = 5
-    ) -> KnowledgeGraph:
         raise NotImplementedError
 
     async def drop(self) -> None:

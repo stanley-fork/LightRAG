@@ -5,8 +5,6 @@ from typing import Any, Union, final
 
 import numpy as np
 
-from lightrag.types import KnowledgeGraph
-
 
 from ..base import BaseGraphStorage, BaseKVStorage, BaseVectorStorage
 from ..namespace import NameSpace, is_namespace
@@ -20,13 +18,7 @@ if not pm.is_installed("pymysql"):
 if not pm.is_installed("sqlalchemy"):
     pm.install("sqlalchemy")
 
-try:
-    from sqlalchemy import create_engine, text
-
-except ImportError as e:
-    raise ImportError(
-        "`pymysql, sqlalchemy` library is not installed. Please install it via pip: `pip install pymysql sqlalchemy`."
-    ) from e
+from sqlalchemy import create_engine, text
 
 
 class TiDB:
@@ -217,6 +209,9 @@ class TiDBKVStorage(BaseKVStorage):
 
     ################ INSERT full_doc AND chunks ################
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
+        logger.info(f"Inserting {len(data)} to {self.namespace}")
+        if not data:
+            return
         left_data = {k: v for k, v in data.items() if k not in self._data}
         self._data.update(left_data)
         if is_namespace(self.namespace, NameSpace.KV_STORE_TEXT_CHUNKS):
@@ -324,12 +319,12 @@ class TiDBVectorDBStorage(BaseVectorStorage):
 
     ###### INSERT entities And relationships ######
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
-        # ignore, upsert in TiDBKVStorage already
-        if not len(data):
-            logger.warning("You insert an empty data to vector DB")
-            return []
+        logger.info(f"Inserting {len(data)} to {self.namespace}")
+        if not data:
+            return
         if is_namespace(self.namespace, NameSpace.VECTOR_STORE_CHUNKS):
-            return []
+            return
+
         logger.info(f"Inserting {len(data)} vectors to {self.namespace}")
 
         list_data = [
@@ -561,14 +556,6 @@ class TiDBGraphStorage(BaseGraphStorage):
         pass
 
     async def delete_node(self, node_id: str) -> None:
-        raise NotImplementedError
-
-    async def get_all_labels(self) -> list[str]:
-        raise NotImplementedError
-
-    async def get_knowledge_graph(
-        self, node_label: str, max_depth: int = 5
-    ) -> KnowledgeGraph:
         raise NotImplementedError
 
 

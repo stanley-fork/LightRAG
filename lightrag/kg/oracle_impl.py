@@ -8,7 +8,6 @@ from typing import Any, Union, final
 import numpy as np
 import configparser
 
-from lightrag.types import KnowledgeGraph
 
 from ..base import (
     BaseGraphStorage,
@@ -26,14 +25,8 @@ if not pm.is_installed("graspologic"):
 if not pm.is_installed("oracledb"):
     pm.install("oracledb")
 
-try:
-    from graspologic import embed
-    import oracledb
-
-except ImportError as e:
-    raise ImportError(
-        "`oracledb` library is not installed. Please install it via pip: `pip install oracledb`."
-    ) from e
+from graspologic import embed
+import oracledb
 
 
 class OracleDB:
@@ -332,6 +325,10 @@ class OracleKVStorage(BaseKVStorage):
 
     ################ INSERT METHODS ################
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
+        logger.info(f"Inserting {len(data)} to {self.namespace}")
+        if not data:
+            return
+
         if is_namespace(self.namespace, NameSpace.KV_STORE_TEXT_CHUNKS):
             list_data = [
                 {
@@ -670,14 +667,6 @@ class OracleGraphStorage(BaseGraphStorage):
             return res
 
     async def delete_node(self, node_id: str) -> None:
-        raise NotImplementedError
-
-    async def get_all_labels(self) -> list[str]:
-        raise NotImplementedError
-
-    async def get_knowledge_graph(
-        self, node_label: str, max_depth: int = 5
-    ) -> KnowledgeGraph:
         raise NotImplementedError
 
 

@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, NamedTuple, Optional, Union, final
 import numpy as np
 import pipmaster as pm
-from lightrag.types import KnowledgeGraph
 
 from tenacity import (
     retry,
@@ -34,14 +33,9 @@ if not pm.is_installed("psycopg-pool"):
 if not pm.is_installed("asyncpg"):
     pm.install("asyncpg")
 
-try:
-    import psycopg
-    from psycopg.rows import namedtuple_row
-    from psycopg_pool import AsyncConnectionPool, PoolTimeout
-except ImportError:
-    raise ImportError(
-        "`psycopg-pool, psycopg[binary,pool], asyncpg` library is not installed. Please install it via pip: `pip install psycopg-pool psycopg[binary,pool] asyncpg`."
-    )
+import psycopg
+from psycopg.rows import namedtuple_row
+from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 
 class AGEQueryException(Exception):
@@ -65,10 +59,6 @@ class AGEQueryException(Exception):
 @final
 @dataclass
 class AGEStorage(BaseGraphStorage):
-    @staticmethod
-    def load_nx_graph(file_name):
-        print("no preloading of graph with AGE in production")
-
     def __init__(self, namespace, global_config, embedding_func):
         super().__init__(
             namespace=namespace,
@@ -623,14 +613,6 @@ class AGEStorage(BaseGraphStorage):
     async def embed_nodes(
         self, algorithm: str
     ) -> tuple[np.ndarray[Any, Any], list[str]]:
-        raise NotImplementedError
-
-    async def get_all_labels(self) -> list[str]:
-        raise NotImplementedError
-
-    async def get_knowledge_graph(
-        self, node_label: str, max_depth: int = 5
-    ) -> KnowledgeGraph:
         raise NotImplementedError
 
     async def index_done_callback(self) -> None:

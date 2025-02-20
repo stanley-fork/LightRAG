@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import json
 import os
+import pipmaster as pm
 from dataclasses import dataclass
 from typing import Any, Dict, List, final
 
@@ -15,19 +16,16 @@ from tenacity import (
     wait_exponential,
 )
 
-from lightrag.types import KnowledgeGraph
 from lightrag.utils import logger
 
 from ..base import BaseGraphStorage
 
-try:
-    from gremlin_python.driver import client, serializer
-    from gremlin_python.driver.aiohttp.transport import AiohttpTransport
-    from gremlin_python.driver.protocol import GremlinServerError
-except ImportError as e:
-    raise ImportError(
-        "`gremlin` library is not installed. Please install it via pip: `pip install gremlin`."
-    ) from e
+if not pm.is_installed("gremlinpython"):
+    pm.install("gremlinpython")
+
+from gremlin_python.driver import client, serializer
+from gremlin_python.driver.aiohttp.transport import AiohttpTransport
+from gremlin_python.driver.protocol import GremlinServerError
 
 
 @final
@@ -402,12 +400,4 @@ class GremlinStorage(BaseGraphStorage):
     async def embed_nodes(
         self, algorithm: str
     ) -> tuple[np.ndarray[Any, Any], list[str]]:
-        raise NotImplementedError
-
-    async def get_all_labels(self) -> list[str]:
-        raise NotImplementedError
-
-    async def get_knowledge_graph(
-        self, node_label: str, max_depth: int = 5
-    ) -> KnowledgeGraph:
         raise NotImplementedError
