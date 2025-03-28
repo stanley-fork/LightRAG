@@ -19,9 +19,10 @@ import tiktoken
 from lightrag.prompt import PROMPTS
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv(override=True)
-
+# use the .env that is inside the current folder
+# allows to use different .env file for each lightrag instance
+# the OS environment variables take precedence over the .env file
+load_dotenv(dotenv_path=".env", override=False)
 
 VERBOSE_DEBUG = os.getenv("VERBOSE", "false").lower() == "true"
 
@@ -46,7 +47,7 @@ def verbose_debug(msg: str, *args, **kwargs):
             formatted_msg = msg
         # Then truncate the formatted message
         truncated_msg = (
-            formatted_msg[:50] + "..." if len(formatted_msg) > 50 else formatted_msg
+            formatted_msg[:100] + "..." if len(formatted_msg) > 100 else formatted_msg
         )
         logger.debug(truncated_msg, **kwargs)
 

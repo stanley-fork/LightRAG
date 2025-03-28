@@ -24,9 +24,7 @@ def check_env_file():
     Returns True if should continue, False if should exit.
     """
     if not os.path.exists(".env"):
-        warning_msg = (
-            "Warning: .env file not found. Some features may not work properly."
-        )
+        warning_msg = "Warning: Startup directory must contain .env file for multi-instance support."
         ASCIIColors.yellow(warning_msg)
 
         # Check if running in interactive terminal
@@ -38,8 +36,10 @@ def check_env_file():
     return True
 
 
-# Load environment variables
-load_dotenv()
+# use the .env that is inside the current folder
+# allows to use different .env file for each lightrag instance
+# the OS environment variables take precedence over the .env file
+load_dotenv(dotenv_path=".env", override=False)
 
 global_args = {"main_args": None}
 
