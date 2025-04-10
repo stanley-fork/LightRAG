@@ -103,8 +103,10 @@ class LightRAG:
     entity_extract_max_gleaning: int = field(default=1)
     """Maximum number of entity extraction attempts for ambiguous content."""
 
-    entity_summary_to_max_tokens: int = field(
-        default=int(os.getenv("MAX_TOKEN_SUMMARY", 500))
+    summary_to_max_tokens: int = field(default=int(os.getenv("MAX_TOKEN_SUMMARY", 500)))
+
+    force_llm_summary_on_merge: int = field(
+        default=int(os.getenv("FORCE_LLM_SUMMARY_ON_MERGE", 6))
     )
 
     # Text chunking
@@ -899,6 +901,13 @@ class LightRAG:
                     try:
                         # Get file path from status document
                         file_path = getattr(status_doc, "file_path", "unknown_source")
+
+                        async with pipeline_status_lock:
+                            log_message = f"Processing file: {file_path}"
+                            pipeline_status["history_messages"].append(log_message)
+                            log_message = f"Processing d-id: {doc_id}"
+                            pipeline_status["latest_message"] = log_message
+                            pipeline_status["history_messages"].append(log_message)
 
                         # Generate chunks from document
                         chunks: dict[str, Any] = {
