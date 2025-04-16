@@ -35,6 +35,13 @@ if not pm.is_installed("asyncpg"):
 import asyncpg  # type: ignore
 from asyncpg import Pool  # type: ignore
 
+from dotenv import load_dotenv
+
+# use the .env that is inside the current folder
+# allows to use different .env file for each lightrag instance
+# the OS environment variables take precedence over the .env file
+load_dotenv(dotenv_path=".env", override=False)
+
 # Get maximum number of graph nodes from environment variable, default is 1000
 MAX_GRAPH_NODES = int(os.getenv("MAX_GRAPH_NODES", 1000))
 
@@ -142,6 +149,9 @@ class PostgreSQLDB:
         with_age: bool = False,
         graph_name: str | None = None,
     ) -> dict[str, Any] | None | list[dict[str, Any]]:
+        # start_time = time.time()
+        # logger.info(f"PostgreSQL, Querying:\n{sql}")
+
         async with self.pool.acquire() as connection:  # type: ignore
             if with_age and graph_name:
                 await self.configure_age(connection, graph_name)  # type: ignore
@@ -166,6 +176,11 @@ class PostgreSQLDB:
                         data = dict(zip(columns, rows[0]))
                     else:
                         data = None
+
+                # query_time = time.time() - start_time
+                # logger.info(f"PostgreSQL, Query result len: {len(data)}")
+                # logger.info(f"PostgreSQL, Query execution time: {query_time:.4f}s")
+
                 return data
             except Exception as e:
                 logger.error(f"PostgreSQL database, error:{e}")
@@ -1023,6 +1038,23 @@ class PGGraphStorage(BaseGraphStorage):
         self.graph_name = self.namespace or os.environ.get("AGE_GRAPH_NAME", "lightrag")
         self.db: PostgreSQLDB | None = None
 
+    @staticmethod
+    def _normalize_node_id(node_id: str) -> str:
+        """
+        Normalize node ID to ensure special characters are properly handled in Cypher queries.
+
+        Args:
+            node_id: The original node ID
+
+        Returns:
+            Normalized node ID suitable for Cypher queries
+        """
+        # Remove quotes
+        normalized_id = node_id.strip('"')
+        # Escape backslashes
+        normalized_id = normalized_id.replace("\\", "\\\\")
+        return normalized_id
+
     async def initialize(self):
         if self.db is None:
             self.db = await ClientManager.get_client()
@@ -1207,7 +1239,7 @@ class PGGraphStorage(BaseGraphStorage):
         return result
 
     async def has_node(self, node_id: str) -> bool:
-        entity_name_label = node_id.strip('"')
+        entity_name_label = self._normalize_node_id(node_id)
 
         query = """SELECT * FROM cypher('%s', $$
                      MATCH (n:base {entity_id: "%s"})
@@ -1219,8 +1251,8 @@ class PGGraphStorage(BaseGraphStorage):
         return single_result["node_exists"]
 
     async def has_edge(self, source_node_id: str, target_node_id: str) -> bool:
-        src_label = source_node_id.strip('"')
-        tgt_label = target_node_id.strip('"')
+        src_label = self._normalize_node_id(source_node_id)
+        tgt_label = self._normalize_node_id(target_node_id)
 
         query = """SELECT * FROM cypher('%s', $$
                      MATCH (a:base {entity_id: "%s"})-[r]-(b:base {entity_id: "%s"})
@@ -1238,7 +1270,7 @@ class PGGraphStorage(BaseGraphStorage):
     async def get_node(self, node_id: str) -> dict[str, str] | None:
         """Get node by its label identifier, return only node properties"""
 
-        label = node_id.strip('"')
+        label = self._normalize_node_id(node_id)
         query = """SELECT * FROM cypher('%s', $$
                      MATCH (n:base {entity_id: "%s"})
                      RETURN n
@@ -1252,7 +1284,7 @@ class PGGraphStorage(BaseGraphStorage):
         return None
 
     async def node_degree(self, node_id: str) -> int:
-        label = node_id.strip('"')
+        label = self._normalize_node_id(node_id)
 
         query = """SELECT * FROM cypher('%s', $$
                      MATCH (n:base {entity_id: "%s"})-[r]-()
@@ -1280,8 +1312,8 @@ class PGGraphStorage(BaseGraphStorage):
     ) -> dict[str, str] | None:
         """Get edge properties between two nodes"""
 
-        src_label = source_node_id.strip('"')
-        tgt_label = target_node_id.strip('"')
+        src_label = self._normalize_node_id(source_node_id)
+        tgt_label = self._normalize_node_id(target_node_id)
 
         query = """SELECT * FROM cypher('%s', $$
                      MATCH (a:base {entity_id: "%s"})-[r]-(b:base {entity_id: "%s"})
@@ -1303,7 +1335,7 @@ class PGGraphStorage(BaseGraphStorage):
         Retrieves all edges (relationships) for a particular node identified by its label.
         :return: list of dictionaries containing edge information
         """
-        label = source_node_id.strip('"')
+        label = self._normalize_node_id(source_node_id)
 
         query = """SELECT * FROM cypher('%s', $$
                       MATCH (n:base {entity_id: "%s"})
@@ -1352,7 +1384,7 @@ class PGGraphStorage(BaseGraphStorage):
                 "PostgreSQL: node properties must contain an 'entity_id' field"
             )
 
-        label = node_id.strip('"')
+        label = self._normalize_node_id(node_id)
         properties = self._format_properties(node_data)
 
         query = """SELECT * FROM cypher('%s', $$
@@ -1388,8 +1420,8 @@ class PGGraphStorage(BaseGraphStorage):
             target_node_id (str): Label of the target node (used as identifier)
             edge_data (dict): dictionary of properties to set on the edge
         """
-        src_label = source_node_id.strip('"')
-        tgt_label = target_node_id.strip('"')
+        src_label = self._normalize_node_id(source_node_id)
+        tgt_label = self._normalize_node_id(target_node_id)
         edge_properties = self._format_properties(edge_data)
 
         query = """SELECT * FROM cypher('%s', $$
@@ -1422,7 +1454,7 @@ class PGGraphStorage(BaseGraphStorage):
         Args:
             node_id (str): The ID of the node to delete.
         """
-        label = node_id.strip('"')
+        label = self._normalize_node_id(node_id)
 
         query = """SELECT * FROM cypher('%s', $$
                      MATCH (n:base {entity_id: "%s"})
@@ -1442,7 +1474,7 @@ class PGGraphStorage(BaseGraphStorage):
         Args:
             node_ids (list[str]): A list of node IDs to remove.
         """
-        node_ids = [node_id.strip('"') for node_id in node_ids]
+        node_ids = [self._normalize_node_id(node_id) for node_id in node_ids]
         node_id_list = ", ".join([f'"{node_id}"' for node_id in node_ids])
 
         query = """SELECT * FROM cypher('%s', $$
@@ -1465,8 +1497,8 @@ class PGGraphStorage(BaseGraphStorage):
             edges (list[tuple[str, str]]): A list of edges to remove, where each edge is a tuple of (source_node_id, target_node_id).
         """
         for source, target in edges:
-            src_label = source.strip('"')
-            tgt_label = target.strip('"')
+            src_label = self._normalize_node_id(source)
+            tgt_label = self._normalize_node_id(target)
 
             query = """SELECT * FROM cypher('%s', $$
                          MATCH (a:base {entity_id: "%s"})-[r]-(b:base {entity_id: "%s"})
@@ -1495,7 +1527,7 @@ class PGGraphStorage(BaseGraphStorage):
 
         # Format node IDs for the query
         formatted_ids = ", ".join(
-            ['"' + node_id.replace('"', "") + '"' for node_id in node_ids]
+            ['"' + self._normalize_node_id(node_id) + '"' for node_id in node_ids]
         )
 
         query = """SELECT * FROM cypher('%s', $$
@@ -1538,7 +1570,7 @@ class PGGraphStorage(BaseGraphStorage):
 
         # Format node IDs for the query
         formatted_ids = ", ".join(
-            ['"' + node_id.replace('"', "") + '"' for node_id in node_ids]
+            ['"' + self._normalize_node_id(node_id) + '"' for node_id in node_ids]
         )
 
         outgoing_query = """SELECT * FROM cypher('%s', $$
@@ -1635,8 +1667,8 @@ class PGGraphStorage(BaseGraphStorage):
         src_nodes = []
         tgt_nodes = []
         for pair in pairs:
-            src_nodes.append(pair["src"].replace('"', ""))
-            tgt_nodes.append(pair["tgt"].replace('"', ""))
+            src_nodes.append(self._normalize_node_id(pair["src"]))
+            tgt_nodes.append(self._normalize_node_id(pair["tgt"]))
 
         src_array = ", ".join([f'"{src}"' for src in src_nodes])
         tgt_array = ", ".join([f'"{tgt}"' for tgt in tgt_nodes])
@@ -1691,7 +1723,7 @@ class PGGraphStorage(BaseGraphStorage):
 
         # Format node IDs for the query
         formatted_ids = ", ".join(
-            ['"' + node_id.replace('"', "") + '"' for node_id in node_ids]
+            ['"' + self._normalize_node_id(node_id) + '"' for node_id in node_ids]
         )
 
         outgoing_query = """SELECT * FROM cypher('%s', $$
@@ -1779,7 +1811,7 @@ class PGGraphStorage(BaseGraphStorage):
                     RETURN count(distinct n) AS total_nodes
                     $$) AS (total_nodes bigint)"""
         else:
-            strip_label = node_label.strip('"')
+            strip_label = self._normalize_node_id(node_label)
             count_query = f"""SELECT * FROM cypher('{self.graph_name}', $$
                     MATCH (n:base {{entity_id: "{strip_label}"}})
                     OPTIONAL MATCH p = (n)-[*..{max_depth}]-()
@@ -1799,7 +1831,7 @@ class PGGraphStorage(BaseGraphStorage):
                     LIMIT {max_nodes}
                     $$) AS (n agtype, r agtype)"""
         else:
-            strip_label = node_label.strip('"')
+            strip_label = self._normalize_node_id(node_label)
             if total_nodes > 0:
                 query = f"""SELECT * FROM cypher('{self.graph_name}', $$
                         MATCH (node:base {{entity_id: "{strip_label}"}})
