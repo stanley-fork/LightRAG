@@ -290,9 +290,9 @@
       "label": "Étiquette",
       "placeholder": "Rechercher des étiquettes...",
       "andOthers": "Et {{count}} autres",
-      "refreshTooltip": "Recharger les données du graphe"
+      "refreshTooltip": "Recharger les données (Après l'ajout de fichier)"
     },
-    "emptyGraph": "Le graphe est vide"
+    "emptyGraph": "Vide (Essayez de recharger)"
   },
   "retrievePanel": {
     "chatMessage": {

@@ -290,9 +290,9 @@
       "label": "التسمية",
       "placeholder": "ابحث في التسميات...",
       "andOthers": "و {{count}} آخرون",
-      "refreshTooltip": "إعادة تحميل بيانات الرسم البياني"
+      "refreshTooltip": "إعادة تحميل البيانات (بعد إضافة الملف)"
     },
-    "emptyGraph": "الرسم البياني فارغ"
+    "emptyGraph": "فارغ (حاول إعادة التحميل)"
   },
   "retrievePanel": {
     "chatMessage": {

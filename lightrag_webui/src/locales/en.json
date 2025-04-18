@@ -290,9 +290,9 @@
       "label": "Label",
       "placeholder": "Search labels...",
       "andOthers": "And {count} others",
-      "refreshTooltip": "Reload graph data"
+      "refreshTooltip": "Reload data(After file added)"
     },
-    "emptyGraph": "Graph Is Empty"
+    "emptyGraph": "Empty(Try Reload Again)"
   },
   "retrievePanel": {
     "chatMessage": {
