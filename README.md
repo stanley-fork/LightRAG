@@ -71,21 +71,6 @@
 
 ## Installation
 
-### Install  LightRAG Core
-
-* Install from source (Recommend)
-
-```bash
-cd LightRAG
-pip install -e .
-```
-
-* Install from PyPI
-
-```bash
-pip install lightrag-hku
-```
-
 ### Install LightRAG Server
 
 The LightRAG Server is designed to provide Web UI and API support. The Web UI facilitates document indexing, knowledge graph exploration, and a simple RAG query interface. LightRAG Server also provide an Ollama compatible interfaces, aiming to emulate LightRAG as an Ollama chat model. This allows AI chat bot, such as Open WebUI, to access LightRAG easily.
@@ -104,17 +89,40 @@ pip install "lightrag-hku[api]"
 pip install -e ".[api]"
 ```
 
-**For more information about LightRAG Server, please refer to [LightRAG Server](./lightrag/api/README.md).**
+### Install  LightRAG Core
 
-## Quick Start for LightRAG core only
-
-* [Video demo](https://www.youtube.com/watch?v=g21royNJ4fw) of running LightRAG locally.
-* All the code can be found in the `examples`.
-* Set OpenAI API key in environment if using OpenAI models: `export OPENAI_API_KEY="sk-...".`
-* Download the demo text "A Christmas Carol by Charles Dickens":
+* Install from source (Recommend)
 
 ```bash
+cd LightRAG
+pip install -e .
+```
+
+* Install from PyPI
+
+```bash
+pip install lightrag-hku
+```
+
+## Quick Start
+
+### Quick Start for LightRAG Server
+
+For more information about LightRAG Server, please refer to [LightRAG Server](./lightrag/api/README.md).
+
+### Quick Start for LightRAG core
+
+To get started with LightRAG core, refer to the sample codes available in the `examples` folder. Additionally, a [video demo](https://www.youtube.com/watch?v=g21royNJ4fw) demonstration is provided to guide you through the local setup process. If you already possess an OpenAI API key, you can run the demo right away:
+
+```bash
+### you should run the demo code with project folder
+cd LightRAG
+### provide your API-KEY for OpenAI
+export OPENAI_API_KEY="sk-...your_opeai_key..."
+### download the demo document of "A Christmas Carol" by Charles Dickens
 curl https://raw.githubusercontent.com/gusye1234/nano-graphrag/main/tests/mock_data.txt > ./book.txt
+### run the demo code
+python examples/lightrag_openai_demo.py
 ```
 
 ## Query
@@ -1156,7 +1164,8 @@ Valid modes are:
 | **doc_status_storage** | `str` | Storage type for documents process status. Supported types: `JsonDocStatusStorage`,`PGDocStatusStorage`,`MongoDocStatusStorage` | `JsonDocStatusStorage` |
 | **chunk_token_size** | `int` | Maximum token size per chunk when splitting documents | `1200` |
 | **chunk_overlap_token_size** | `int` | Overlap token size between two chunks when splitting documents | `100` |
-| **tiktoken_model_name** | `str` | Model name for the Tiktoken encoder used to calculate token numbers | `gpt-4o-mini` |
+| **tokenizer** | `Tokenizer` | The function used to convert text into tokens (numbers) and back using .encode() and .decode() functions following `TokenizerInterface` protocol. If you don't specify one, it will use the default Tiktoken tokenizer. | `TiktokenTokenizer` |
+| **tiktoken_model_name** | `str` | If you're using the default Tiktoken tokenizer, this is the name of the specific Tiktoken model to use. This setting is ignored if you provide your own tokenizer. | `gpt-4o-mini` |
 | **entity_extract_max_gleaning** | `int` | Number of loops in the entity extraction process, appending history messages | `1` |
 | **entity_summary_to_max_tokens** | `int` | Maximum token size for each entity summary | `500` |
 | **node_embedding_algorithm** | `str` | Algorithm for node embedding (currently not used) | `node2vec` |

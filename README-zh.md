@@ -35,21 +35,6 @@
 
 ## 安装
 
-### 安装LightRAG Core
-
-* 从源代码安装（推荐）
-
-```bash
-cd LightRAG
-pip install -e .
-```
-
-* 从PyPI安装
-
-```bash
-pip install lightrag-hku
-```
-
 ### 安装LightRAG服务器
 
 LightRAG服务器旨在提供Web UI和API支持。Web UI便于文档索引、知识图谱探索和简单的RAG查询界面。LightRAG服务器还提供兼容Ollama的接口，旨在将LightRAG模拟为Ollama聊天模型。这使得AI聊天机器人（如Open WebUI）可以轻松访问LightRAG。
@@ -68,17 +53,40 @@ pip install "lightrag-hku[api]"
 pip install -e ".[api]"
 ```
 
-**有关LightRAG服务器的更多信息，请参阅[LightRAG服务器](./lightrag/api/README.md)。**
+### 安装LightRAG Core
 
-## 快速开始 (仅对LightRAG Core)
-
-* [视频演示](https://www.youtube.com/watch?v=g21royNJ4fw)展示如何在本地运行LightRAG。
-* 所有代码都可以在`examples`中找到。
-* 如果使用OpenAI模型，请在环境中设置OpenAI API密钥：`export OPENAI_API_KEY="sk-..."`。
-* 下载演示文本"狄更斯的圣诞颂歌"：
+* 从源代码安装（推荐）
 
 ```bash
+cd LightRAG
+pip install -e .
+```
+
+* 从PyPI安装
+
+```bash
+pip install lightrag-hku
+```
+
+## 快速开始
+
+### 使用LightRAG服务器
+
+**有关LightRAG服务器的更多信息，请参阅[LightRAG服务器](./lightrag/api/README.md)。**
+
+## 使用LightRAG Core
+
+LightRAG核心功能的示例代码请参见`examples`目录。您还可参照[视频](https://www.youtube.com/watch?v=g21royNJ4fw)视频完成环境配置。若已持有OpenAI API密钥，可以通过以下命令运行演示代码：
+
+```bash
+### you should run the demo code with project folder
+cd LightRAG
+### provide your API-KEY for OpenAI
+export OPENAI_API_KEY="sk-...your_opeai_key..."
+### download the demo document of "A Christmas Carol" by Charles Dickens
 curl https://raw.githubusercontent.com/gusye1234/nano-graphrag/main/tests/mock_data.txt > ./book.txt
+### run the demo code
+python examples/lightrag_openai_demo.py
 ```
 
 ## 查询
@@ -1090,7 +1098,8 @@ rag.clear_cache(modes=["local"])
 | **doc_status_storage** | `str` | Storage type for documents process status. Supported types: `JsonDocStatusStorage`,`PGDocStatusStorage`,`MongoDocStatusStorage` | `JsonDocStatusStorage` |
 | **chunk_token_size** | `int` | 拆分文档时每个块的最大令牌大小 | `1200` |
 | **chunk_overlap_token_size** | `int` | 拆分文档时两个块之间的重叠令牌大小 | `100` |
-| **tiktoken_model_name** | `str` | 用于计算令牌数的Tiktoken编码器的模型名称 | `gpt-4o-mini` |
+| **tokenizer** | `Tokenizer` | 用于将文本转换为 tokens（数字）以及使用遵循 TokenizerInterface 协议的 .encode() 和 .decode() 函数将 tokens 转换回文本的函数。 如果您不指定，它将使用默认的 Tiktoken tokenizer。 | `TiktokenTokenizer` |
+| **tiktoken_model_name** | `str` | 如果您使用的是默认的 Tiktoken tokenizer，那么这是要使用的特定 Tiktoken 模型的名称。如果您提供自己的 tokenizer，则忽略此设置。 | `gpt-4o-mini` |
 | **entity_extract_max_gleaning** | `int` | 实体提取过程中的循环次数，附加历史消息 | `1` |
 | **entity_summary_to_max_tokens** | `int` | 每个实体摘要的最大令牌大小 | `500` |
 | **node_embedding_algorithm** | `str` | 节点嵌入算法（当前未使用） | `node2vec` |
