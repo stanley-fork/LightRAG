@@ -730,6 +730,7 @@ async def handle_cache(
         if not hashing_kv.global_config.get("enable_llm_cache"):
             return None, None, None, None
 
+        # TODO: deprecated (PostgreSQL cache not implemented yet)
         # Get embedding cache configuration
         embedding_cache_config = hashing_kv.global_config.get(
             "embedding_cache_config",
@@ -1448,9 +1449,13 @@ def normalize_extracted_info(name: str, is_entity=False) -> str:
     # (?=[\u4e00-\u9fa5]): Positive lookahead for Chinese character
     name = re.sub(r"(?<=[\u4e00-\u9fa5])\s+(?=[\u4e00-\u9fa5])", "", name)
 
-    # Remove spaces between Chinese and English/numbers
-    name = re.sub(r"(?<=[\u4e00-\u9fa5])\s+(?=[a-zA-Z0-9])", "", name)
-    name = re.sub(r"(?<=[a-zA-Z0-9])\s+(?=[\u4e00-\u9fa5])", "", name)
+    # Remove spaces between Chinese and English/numbers/symbols
+    name = re.sub(
+        r"(?<=[\u4e00-\u9fa5])\s+(?=[a-zA-Z0-9\(\)\[\]@#$%!&\*\-=+_])", "", name
+    )
+    name = re.sub(
+        r"(?<=[a-zA-Z0-9\(\)\[\]@#$%!&\*\-=+_])\s+(?=[\u4e00-\u9fa5])", "", name
+    )
 
     # Remove English quotation marks from the beginning and end
     if len(name) >= 2 and name.startswith('"') and name.endswith('"'):
