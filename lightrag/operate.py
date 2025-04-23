@@ -602,8 +602,8 @@ async def extract_entities(
 
         # Get initial extraction
         hint_prompt = entity_extract_prompt.format(
-            **context_base, input_text="{input_text}"
-        ).format(**context_base, input_text=content)
+            **{**context_base, "input_text": content}
+        )
 
         final_result = await use_llm_func_with_cache(
             hint_prompt,
@@ -1183,6 +1183,13 @@ async def mix_kg_vector_query(
                 key=lambda x: x["content"],
                 max_token_size=query_param.max_token_for_text_unit,
                 tokenizer=tokenizer,
+            )
+
+            logger.debug(
+                f"Truncate chunks from {len(valid_chunks)} to {len(maybe_trun_chunks)} (max tokens:{query_param.max_token_for_text_unit})"
+            )
+            logger.info(
+                f"Naive query: {len(maybe_trun_chunks)} chunks, top_k: {mix_topk}"
             )
 
             if not maybe_trun_chunks:
@@ -2012,6 +2019,9 @@ async def naive_query(
 
     logger.debug(
         f"Truncate chunks from {len(chunks)} to {len(maybe_trun_chunks)} (max tokens:{query_param.max_token_for_text_unit})"
+    )
+    logger.info(
+        f"Naive query: {len(maybe_trun_chunks)} chunks, top_k: {query_param.top_k}"
     )
 
     section = "\n--New Chunk--\n".join(
