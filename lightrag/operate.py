@@ -1213,15 +1213,12 @@ async def mix_kg_vector_query(
             if not results:
                 return None
 
-            chunks_ids = [r["id"] for r in results]
-            chunks = await text_chunks_db.get_by_ids(chunks_ids)
-
             valid_chunks = []
-            for chunk, result in zip(chunks, results):
-                if chunk is not None and "content" in chunk:
-                    # Merge chunk content and time metadata
+            for result in results:
+                if "content" in result:
+                    # Directly use content from chunks_vdb.query result
                     chunk_with_time = {
-                        "content": chunk["content"],
+                        "content": result["content"],
                         "created_at": result.get("created_at", None),
                         "file_path": result.get("file_path", None),
                     }
@@ -1250,15 +1247,15 @@ async def mix_kg_vector_query(
             # Include time information in content
             formatted_chunks = []
             for c in maybe_trun_chunks:
-                chunk_text = "File path: " + c["file_path"] + "\n" + c["content"]
+                chunk_text = "File path: " + c["file_path"] + "\r\n\r\n" + c["content"]
                 if c["created_at"]:
-                    chunk_text = f"[Created at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(c['created_at']))}]\n{chunk_text}"
+                    chunk_text = f"[Created at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(c['created_at']))}]\r\n\r\n{chunk_text}"
                 formatted_chunks.append(chunk_text)
 
             logger.debug(
-                f"Truncate chunks from {len(chunks)} to {len(formatted_chunks)} (max tokens:{query_param.max_token_for_text_unit})"
+                f"Truncate chunks from {len(valid_chunks)} to {len(formatted_chunks)} (max tokens:{query_param.max_token_for_text_unit})"
             )
-            return "\n--New Chunk--\n".join(formatted_chunks)
+            return "\r\n\r\n--New Chunk--\r\n\r\n".join(formatted_chunks)
         except Exception as e:
             logger.error(f"Error in get_vector_context: {e}")
             return None
@@ -1274,12 +1271,12 @@ async def mix_kg_vector_query(
 
     if query_param.only_need_context:
         context_str = f"""
-        -----Knowledge Graph Context-----
-        {kg_context if kg_context else "No relevant knowledge graph information found"}
+\r\n\r\n=====Knowledge Graph Context=====\r\n\r\n
+{kg_context if kg_context else "No relevant knowledge graph information found"}
 
-        -----Vector Context-----
-        {vector_context if vector_context else "No relevant text information found"}
-        """.strip()
+\r\n\r\n=====Vector Context=====\r\n\r\n
+{vector_context if vector_context else "No relevant text information found"}
+""".strip()
         return context_str
 
     # 5. Construct hybrid prompt
@@ -2052,13 +2049,7 @@ async def naive_query(
     if not len(results):
         return PROMPTS["fail_response"]
 
-    chunks_ids = [r["id"] for r in results]
-    chunks = await text_chunks_db.get_by_ids(chunks_ids)
-
-    # Filter out invalid chunks
-    valid_chunks = [
-        chunk for chunk in chunks if chunk is not None and "content" in chunk
-    ]
+    valid_chunks = [result for result in results if "content" in result]
 
     if not valid_chunks:
         logger.warning("No valid chunks found after filtering")
@@ -2077,15 +2068,15 @@ async def naive_query(
         return PROMPTS["fail_response"]
 
     logger.debug(
-        f"Truncate chunks from {len(chunks)} to {len(maybe_trun_chunks)} (max tokens:{query_param.max_token_for_text_unit})"
+        f"Truncate chunks from {len(valid_chunks)} to {len(maybe_trun_chunks)} (max tokens:{query_param.max_token_for_text_unit})"
     )
     logger.info(
         f"Naive query: {len(maybe_trun_chunks)} chunks, top_k: {query_param.top_k}"
     )
 
-    section = "\n--New Chunk--\n".join(
+    section = "\r\n\r\n--New Chunk--\r\n\r\n".join(
         [
-            "File path: " + c["file_path"] + "\n" + c["content"]
+            "File path: " + c["file_path"] + "\r\n\r\n" + c["content"]
             for c in maybe_trun_chunks
         ]
     )
