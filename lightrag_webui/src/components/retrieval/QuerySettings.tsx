@@ -1,9 +1,9 @@
 import { useCallback } from 'react'
 import { QueryMode, QueryRequest } from '@/api/lightrag'
 // Removed unused import for Text component
-import Input from '@/components/ui/Input'
 import Checkbox from '@/components/ui/Checkbox'
 import NumberInput from '@/components/ui/NumberInput'
+import Input from '@/components/ui/Input'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/Card'
 import {
   Select,
@@ -29,7 +29,7 @@ export default function QuerySettings() {
     <Card className="flex shrink-0 flex-col min-w-[220px]">
       <CardHeader className="px-4 pt-4 pb-2">
         <CardTitle>{t('retrievePanel.querySettings.parametersTitle')}</CardTitle>
-        <CardDescription>{t('retrievePanel.querySettings.parametersDescription')}</CardDescription>
+        <CardDescription className="sr-only">{t('retrievePanel.querySettings.parametersDescription')}</CardDescription>
       </CardHeader>
       <CardContent className="m-0 flex grow flex-col p-0 text-xs">
         <div className="relative size-full">
@@ -242,69 +242,29 @@ export default function QuerySettings() {
               </div>
             </>
 
-            {/* Keywords */}
+            {/* User Prompt */}
             <>
-              <>
-                <TooltipProvider>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <label htmlFor="hl_keywords" className="ml-1 cursor-help">
-                        {t('retrievePanel.querySettings.hlKeywords')}
-                      </label>
-                    </TooltipTrigger>
-                    <TooltipContent side="left">
-                      <p>{t('retrievePanel.querySettings.hlKeywordsTooltip')}</p>
-                    </TooltipContent>
-                  </Tooltip>
-                </TooltipProvider>
-                <div>
-                  {/* Removed sr-only label */}
-                  <Input
-                    id="hl_keywords"
-                    type="text"
-                    value={querySettings.hl_keywords?.join(', ')}
-                    onChange={(e) => {
-                      const keywords = e.target.value
-                        .split(',')
-                        .map((k) => k.trim())
-                        .filter((k) => k !== '')
-                      handleChange('hl_keywords', keywords)
-                    }}
-                    placeholder={t('retrievePanel.querySettings.hlkeywordsPlaceHolder')}
-                  />
-                </div>
-              </>
-
-              <>
-                <TooltipProvider>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <label htmlFor="ll_keywords" className="ml-1 cursor-help">
-                        {t('retrievePanel.querySettings.llKeywords')}
-                      </label>
-                    </TooltipTrigger>
-                    <TooltipContent side="left">
-                      <p>{t('retrievePanel.querySettings.llKeywordsTooltip')}</p>
-                    </TooltipContent>
-                  </Tooltip>
-                </TooltipProvider>
-                <div>
-                  {/* Removed sr-only label */}
-                  <Input
-                    id="ll_keywords"
-                    type="text"
-                    value={querySettings.ll_keywords?.join(', ')}
-                    onChange={(e) => {
-                      const keywords = e.target.value
-                        .split(',')
-                        .map((k) => k.trim())
-                        .filter((k) => k !== '')
-                      handleChange('ll_keywords', keywords)
-                    }}
-                    placeholder={t('retrievePanel.querySettings.hlkeywordsPlaceHolder')}
-                  />
-                </div>
-              </>
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <label htmlFor="user_prompt" className="ml-1 cursor-help">
+                      {t('retrievePanel.querySettings.userPrompt')}
+                    </label>
+                  </TooltipTrigger>
+                  <TooltipContent side="left">
+                    <p>{t('retrievePanel.querySettings.userPromptTooltip')}</p>
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+              <div>
+                <Input
+                  id="user_prompt"
+                  value={querySettings.user_prompt}
+                  onChange={(e) => handleChange('user_prompt', e.target.value)}
+                  placeholder={t('retrievePanel.querySettings.userPromptPlaceholder')}
+                  className="h-9"
+                />
+              </div>
             </>
 
             {/* Toggle Options */}
