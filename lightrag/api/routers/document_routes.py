@@ -12,11 +12,18 @@ import pipmaster as pm
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Literal
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    HTTPException,
+    UploadFile,
+)
 from pydantic import BaseModel, Field, field_validator
 
 from lightrag import LightRAG
-from lightrag.base import DocProcessingStatus, DocStatus
+from lightrag.base import DeletionResult, DocProcessingStatus, DocStatus
 from lightrag.api.utils_api import get_combined_auth_dependency
 from ..config import global_args
 
@@ -84,22 +91,30 @@ class InsertTextRequest(BaseModel):
 
     Attributes:
         text: The text content to be inserted into the RAG system
+        file_source: Source of the text (optional)
     """
 
     text: str = Field(
         min_length=1,
         description="The text to insert",
     )
+    file_source: str = Field(default=None, min_length=0, description="File Source")
 
     @field_validator("text", mode="after")
     @classmethod
-    def strip_after(cls, text: str) -> str:
+    def strip_text_after(cls, text: str) -> str:
         return text.strip()
+
+    @field_validator("file_source", mode="after")
+    @classmethod
+    def strip_source_after(cls, file_source: str) -> str:
+        return file_source.strip()
 
     class Config:
         json_schema_extra = {
             "example": {
-                "text": "This is a sample text to be inserted into the RAG system."
+                "text": "This is a sample text to be inserted into the RAG system.",
+                "file_source": "Source of the text (optional)",
             }
         }
 
@@ -109,17 +124,26 @@ class InsertTextsRequest(BaseModel):
 
     Attributes:
         texts: List of text contents to be inserted into the RAG system
+        file_sources: Sources of the texts (optional)
     """
 
     texts: list[str] = Field(
         min_length=1,
         description="The texts to insert",
     )
+    file_sources: list[str] = Field(
+        default=None, min_length=0, description="Sources of the texts"
+    )
 
     @field_validator("texts", mode="after")
     @classmethod
-    def strip_after(cls, texts: list[str]) -> list[str]:
+    def strip_texts_after(cls, texts: list[str]) -> list[str]:
         return [text.strip() for text in texts]
+
+    @field_validator("file_sources", mode="after")
+    @classmethod
+    def strip_sources_after(cls, file_sources: list[str]) -> list[str]:
+        return [file_source.strip() for file_source in file_sources]
 
     class Config:
         json_schema_extra = {
@@ -127,7 +151,10 @@ class InsertTextsRequest(BaseModel):
                 "texts": [
                     "This is the first text to be inserted.",
                     "This is the second text to be inserted.",
-                ]
+                ],
+                "file_sources": [
+                    "First file source (optional)",
+                ],
             }
         }
 
@@ -230,6 +257,40 @@ Attributes:
     metadata: Additional metadata (optional)
     file_path: Path to the document file
 """
+
+
+class DeleteDocRequest(BaseModel):
+    doc_id: str = Field(..., description="The ID of the document to delete.")
+
+    @field_validator("doc_id", mode="after")
+    @classmethod
+    def validate_doc_id(cls, doc_id: str) -> str:
+        if not doc_id or not doc_id.strip():
+            raise ValueError("Document ID cannot be empty")
+        return doc_id.strip()
+
+
+class DeleteEntityRequest(BaseModel):
+    entity_name: str = Field(..., description="The name of the entity to delete.")
+
+    @field_validator("entity_name", mode="after")
+    @classmethod
+    def validate_entity_name(cls, entity_name: str) -> str:
+        if not entity_name or not entity_name.strip():
+            raise ValueError("Entity name cannot be empty")
+        return entity_name.strip()
+
+
+class DeleteRelationRequest(BaseModel):
+    source_entity: str = Field(..., description="The name of the source entity.")
+    target_entity: str = Field(..., description="The name of the target entity.")
+
+    @field_validator("source_entity", "target_entity", mode="after")
+    @classmethod
+    def validate_entity_names(cls, entity_name: str) -> str:
+        if not entity_name or not entity_name.strip():
+            raise ValueError("Entity name cannot be empty")
+        return entity_name.strip()
 
 
 class DocStatusResponse(BaseModel):
@@ -656,16 +717,25 @@ async def pipeline_index_files(rag: LightRAG, file_paths: List[Path]):
         logger.error(traceback.format_exc())
 
 
-async def pipeline_index_texts(rag: LightRAG, texts: List[str]):
+async def pipeline_index_texts(
+    rag: LightRAG, texts: List[str], file_sources: List[str] = None
+):
     """Index a list of texts
 
     Args:
         rag: LightRAG instance
         texts: The texts to index
+        file_sources: Sources of the texts
     """
     if not texts:
         return
-    await rag.apipeline_enqueue_documents(texts)
+    if file_sources is not None:
+        if len(file_sources) != 0 and len(file_sources) != len(texts):
+            [
+                file_sources.append("unknown_source")
+                for _ in range(len(file_sources), len(texts))
+            ]
+    await rag.apipeline_enqueue_documents(input=texts, file_paths=file_sources)
     await rag.apipeline_process_enqueue_documents()
 
 
@@ -816,7 +886,12 @@ def create_document_routes(
             HTTPException: If an error occurs during text processing (500).
         """
         try:
-            background_tasks.add_task(pipeline_index_texts, rag, [request.text])
+            background_tasks.add_task(
+                pipeline_index_texts,
+                rag,
+                [request.text],
+                file_sources=[request.file_source],
+            )
             return InsertResponse(
                 status="success",
                 message="Text successfully received. Processing will continue in background.",
@@ -851,7 +926,12 @@ def create_document_routes(
             HTTPException: If an error occurs during text processing (500).
         """
         try:
-            background_tasks.add_task(pipeline_index_texts, rag, request.texts)
+            background_tasks.add_task(
+                pipeline_index_texts,
+                rag,
+                request.texts,
+                file_sources=request.file_sources,
+            )
             return InsertResponse(
                 status="success",
                 message="Text successfully received. Processing will continue in background.",
@@ -1279,6 +1359,119 @@ def create_document_routes(
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
 
+    class DeleteDocByIdResponse(BaseModel):
+        """Response model for single document deletion operation."""
+
+        status: Literal["success", "fail", "not_found", "busy"] = Field(
+            description="Status of the deletion operation"
+        )
+        message: str = Field(description="Message describing the operation result")
+        doc_id: Optional[str] = Field(
+            default=None, description="The ID of the document."
+        )
+
+    @router.delete(
+        "/delete_document",
+        response_model=DeleteDocByIdResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Delete a document and all its associated data by its ID.",
+    )
+
+    # TODO This method needs to be modified to be asynchronous (please do not use)
+    async def delete_document(
+        delete_request: DeleteDocRequest,
+    ) -> DeleteDocByIdResponse:
+        """
+        This method needs to be modified to be asynchronous (please do not use)
+
+        Deletes a specific document and all its associated data, including its status,
+        text chunks, vector embeddings, and any related graph data.
+        It is disabled when llm cache for entity extraction is disabled.
+
+        This operation is irreversible and will interact with the pipeline status.
+
+        Args:
+            delete_request (DeleteDocRequest): The request containing the document ID.
+
+        Returns:
+            DeleteDocByIdResponse: The result of the deletion operation.
+                - status="success": The document was successfully deleted.
+                - status="not_found": The document with the specified ID was not found.
+                - status="fail": The deletion operation failed.
+                - status="busy": The pipeline is busy with another operation.
+
+        Raises:
+            HTTPException:
+              - 500: If an unexpected internal error occurs.
+        """
+        # The rag object is initialized from the server startup args,
+        # so we can access its properties here.
+        if not rag.enable_llm_cache_for_entity_extract:
+            raise HTTPException(
+                status_code=403,
+                detail="Operation not allowed when LLM cache for entity extraction is disabled.",
+            )
+        from lightrag.kg.shared_storage import (
+            get_namespace_data,
+            get_pipeline_status_lock,
+        )
+
+        doc_id = delete_request.doc_id
+        pipeline_status = await get_namespace_data("pipeline_status")
+        pipeline_status_lock = get_pipeline_status_lock()
+
+        async with pipeline_status_lock:
+            if pipeline_status.get("busy", False):
+                return DeleteDocByIdResponse(
+                    status="busy",
+                    message="Cannot delete document while pipeline is busy",
+                    doc_id=doc_id,
+                )
+            pipeline_status.update(
+                {
+                    "busy": True,
+                    "job_name": f"Deleting Document: {doc_id}",
+                    "job_start": datetime.now().isoformat(),
+                    "latest_message": "Starting document deletion process",
+                }
+            )
+            # Use slice assignment to clear the list in place
+            pipeline_status["history_messages"][:] = [
+                f"Starting deletion for doc_id: {doc_id}"
+            ]
+
+        try:
+            result = await rag.adelete_by_doc_id(doc_id)
+            if "history_messages" in pipeline_status:
+                pipeline_status["history_messages"].append(result.message)
+
+            if result.status == "not_found":
+                raise HTTPException(status_code=404, detail=result.message)
+            if result.status == "fail":
+                raise HTTPException(status_code=500, detail=result.message)
+
+            return DeleteDocByIdResponse(
+                doc_id=result.doc_id,
+                message=result.message,
+                status=result.status,
+            )
+
+        except Exception as e:
+            error_msg = f"Error deleting document {doc_id}: {str(e)}"
+            logger.error(error_msg)
+            logger.error(traceback.format_exc())
+            if "history_messages" in pipeline_status:
+                pipeline_status["history_messages"].append(error_msg)
+            # Re-raise as HTTPException for consistent error handling by FastAPI
+            raise HTTPException(status_code=500, detail=error_msg)
+        finally:
+            async with pipeline_status_lock:
+                pipeline_status["busy"] = False
+                completion_msg = f"Document deletion process for {doc_id} completed."
+                pipeline_status["latest_message"] = completion_msg
+                if "history_messages" in pipeline_status:
+                    pipeline_status["history_messages"].append(completion_msg)
+
     @router.post(
         "/clear_cache",
         response_model=ClearCacheResponse,
@@ -1331,5 +1524,78 @@ def create_document_routes(
             logger.error(f"Error clearing cache: {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
+
+    @router.delete(
+        "/delete_entity",
+        response_model=DeletionResult,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def delete_entity(request: DeleteEntityRequest):
+        """
+        Delete an entity and all its relationships from the knowledge graph.
+
+        Args:
+            request (DeleteEntityRequest): The request body containing the entity name.
+
+        Returns:
+            DeletionResult: An object containing the outcome of the deletion process.
+
+        Raises:
+            HTTPException: If the entity is not found (404) or an error occurs (500).
+        """
+        try:
+            result = await rag.adelete_by_entity(entity_name=request.entity_name)
+            if result.status == "not_found":
+                raise HTTPException(status_code=404, detail=result.message)
+            if result.status == "fail":
+                raise HTTPException(status_code=500, detail=result.message)
+            # Set doc_id to empty string since this is an entity operation, not document
+            result.doc_id = ""
+            return result
+        except HTTPException:
+            raise
+        except Exception as e:
+            error_msg = f"Error deleting entity '{request.entity_name}': {str(e)}"
+            logger.error(error_msg)
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=error_msg)
+
+    @router.delete(
+        "/delete_relation",
+        response_model=DeletionResult,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def delete_relation(request: DeleteRelationRequest):
+        """
+        Delete a relationship between two entities from the knowledge graph.
+
+        Args:
+            request (DeleteRelationRequest): The request body containing the source and target entity names.
+
+        Returns:
+            DeletionResult: An object containing the outcome of the deletion process.
+
+        Raises:
+            HTTPException: If the relation is not found (404) or an error occurs (500).
+        """
+        try:
+            result = await rag.adelete_by_relation(
+                source_entity=request.source_entity,
+                target_entity=request.target_entity,
+            )
+            if result.status == "not_found":
+                raise HTTPException(status_code=404, detail=result.message)
+            if result.status == "fail":
+                raise HTTPException(status_code=500, detail=result.message)
+            # Set doc_id to empty string since this is a relation operation, not document
+            result.doc_id = ""
+            return result
+        except HTTPException:
+            raise
+        except Exception as e:
+            error_msg = f"Error deleting relation from '{request.source_entity}' to '{request.target_entity}': {str(e)}"
+            logger.error(error_msg)
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=error_msg)
 
     return router

@@ -4,6 +4,7 @@
 
 ## 🎉 新闻
 
+- [X] [2025.06.05]🎯📢LightRAG现已集成RAG-Anything，支持全面的多模态文档解析与RAG能力（PDF、图片、Office文档、表格、公式等）。详见下方[多模态处理模块](https://github.com/HKUDS/LightRAG?tab=readme-ov-file#多模态文档处理rag-anything集成)。
 - [X] [2025.03.18]🎯📢LightRAG现已支持引文功能。
 - [X] [2025.02.05]🎯📢我们团队发布了[VideoRAG](https://github.com/HKUDS/VideoRAG)，用于理解超长上下文视频。
 - [X] [2025.01.13]🎯📢我们团队发布了[MiniRAG](https://github.com/HKUDS/MiniRAG)，使用小型模型简化RAG。
@@ -931,6 +932,94 @@ rag.insert_custom_kg(custom_kg)
 
 </details>
 
+## 删除功能
+
+LightRAG提供了全面的删除功能，允许您删除文档、实体和关系。
+
+<details>
+<summary> <b>删除实体</b> </summary>
+
+您可以通过实体名称删除实体及其所有关联关系：
+
+```python
+# 删除实体及其所有关系（同步版本）
+rag.delete_by_entity("Google")
+
+# 异步版本
+await rag.adelete_by_entity("Google")
+```
+
+删除实体时会：
+- 从知识图谱中移除该实体节点
+- 删除该实体的所有关联关系
+- 从向量数据库中移除相关的嵌入向量
+- 保持知识图谱的完整性
+
+</details>
+
+<details>
+<summary> <b>删除关系</b> </summary>
+
+您可以删除两个特定实体之间的关系：
+
+```python
+# 删除两个实体之间的关系（同步版本）
+rag.delete_by_relation("Google", "Gmail")
+
+# 异步版本
+await rag.adelete_by_relation("Google", "Gmail")
+```
+
+删除关系时会：
+- 移除指定的关系边
+- 从向量数据库中删除关系的嵌入向量
+- 保留两个实体节点及其他关系
+
+</details>
+
+<details>
+<summary> <b>通过文档ID删除</b> </summary>
+
+您可以通过文档ID删除整个文档及其相关的所有知识：
+
+```python
+# 通过文档ID删除（异步版本）
+await rag.adelete_by_doc_id("doc-12345")
+```
+
+通过文档ID删除时的优化处理：
+- **智能清理**：自动识别并删除仅属于该文档的实体和关系
+- **保留共享知识**：如果实体或关系在其他文档中也存在，则会保留并重新构建描述
+- **缓存优化**：清理相关的LLM缓存以减少存储开销
+- **增量重建**：从剩余文档重新构建受影响的实体和关系描述
+
+删除过程包括：
+1. 删除文档相关的所有文本块
+2. 识别仅属于该文档的实体和关系并删除
+3. 重新构建在其他文档中仍存在的实体和关系
+4. 更新所有相关的向量索引
+5. 清理文档状态记录
+
+注意：通过文档ID删除是一个异步操作，因为它涉及复杂的知识图谱重构过程。
+
+</details>
+
+<details>
+<summary> <b>删除注意事项</b> </summary>
+
+**重要提醒：**
+
+1. **不可逆操作**：所有删除操作都是不可逆的，请谨慎使用
+2. **性能考虑**：删除大量数据时可能需要一些时间，特别是通过文档ID删除
+3. **数据一致性**：删除操作会自动维护知识图谱和向量数据库之间的一致性
+4. **备份建议**：在执行重要删除操作前建议备份数据
+
+**批量删除建议：**
+- 对于批量删除操作，建议使用异步方法以获得更好的性能
+- 大规模删除时，考虑分批进行以避免系统负载过高
+
+</details>
+
 ## 实体合并
 
 <details>
@@ -1001,6 +1090,60 @@ rag.merge_entities(
 * 保留关系权重和属性
 
 </details>
+
+## 多模态文档处理（RAG-Anything集成）
+
+LightRAG 现已与 [RAG-Anything](https://github.com/HKUDS/RAG-Anything) 实现无缝集成，这是一个专为 LightRAG 构建的**全能多模态文档处理RAG系统**。RAG-Anything 提供先进的解析和检索增强生成（RAG）能力，让您能够无缝处理多模态文档，并从各种文档格式中提取结构化内容——包括文本、图片、表格和公式——以集成到您的RAG流程中。
+
+**主要特性：**
+- **端到端多模态流程**：从文档摄取解析到智能多模态问答的完整工作流程
+- **通用文档支持**：无缝处理PDF、Office文档（DOC/DOCX/PPT/PPTX/XLS/XLSX）、图片和各种文件格式
+- **专业内容分析**：针对图片、表格、数学公式和异构内容类型的专用处理器
+- **多模态知识图谱**：自动实体提取和跨模态关系发现以增强理解
+- **混合智能检索**：覆盖文本和多模态内容的高级搜索能力，具备上下文理解
+
+**快速开始：**
+1. 安装RAG-Anything：
+   ```bash
+   pip install raganything
+   ```
+2. 处理多模态文档：
+   ```python
+   import asyncio
+   from raganything import RAGAnything
+   from lightrag.llm.openai import openai_complete_if_cache, openai_embed
+
+   async def main():
+       # 使用LightRAG集成初始化RAGAnything
+       rag = RAGAnything(
+           working_dir="./rag_storage",
+           llm_model_func=lambda prompt, **kwargs: openai_complete_if_cache(
+               "gpt-4o-mini", prompt, api_key="your-api-key", **kwargs
+           ),
+           embedding_func=lambda texts: openai_embed(
+               texts, model="text-embedding-3-large", api_key="your-api-key"
+           ),
+           embedding_dim=3072,
+       )
+
+       # 处理多模态文档
+       await rag.process_document_complete(
+           file_path="path/to/your/document.pdf",
+           output_dir="./output"
+       )
+
+       # 查询多模态内容
+       result = await rag.query_with_multimodal(
+           "图表中显示的主要发现是什么？",
+           mode="hybrid"
+       )
+       print(result)
+
+   if __name__ == "__main__":
+       asyncio.run(main())
+   ```
+
+如需详细文档和高级用法，请参阅 [RAG-Anything 仓库](https://github.com/HKUDS/RAG-Anything)。
 
 ## Token统计功能
 

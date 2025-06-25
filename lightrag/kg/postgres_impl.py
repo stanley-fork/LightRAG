@@ -27,6 +27,7 @@ from ..base import (
 )
 from ..namespace import NameSpace, is_namespace
 from ..utils import logger
+from ..constants import GRAPH_FIELD_SEP
 
 import pipmaster as pm
 
@@ -49,13 +50,13 @@ MAX_GRAPH_NODES = int(os.getenv("MAX_GRAPH_NODES", 1000))
 
 class PostgreSQLDB:
     def __init__(self, config: dict[str, Any], **kwargs: Any):
-        self.host = config.get("host", "localhost")
-        self.port = config.get("port", 5432)
-        self.user = config.get("user", "postgres")
-        self.password = config.get("password", None)
-        self.database = config.get("database", "postgres")
-        self.workspace = config.get("workspace", "default")
-        self.max = int(config.get("max_connections", 12))
+        self.host = config["host"]
+        self.port = config["port"]
+        self.user = config["user"]
+        self.password = config["password"]
+        self.database = config["database"]
+        self.workspace = config["workspace"]
+        self.max = int(config["max_connections"])
         self.increment = 1
         self.pool: Pool | None = None
 
@@ -105,6 +106,35 @@ class PostgreSQLDB:
             asyncpg.exceptions.UniqueViolationError,
         ):
             pass
+
+    async def _migrate_llm_cache_add_chunk_id(self):
+        """Add chunk_id column to LIGHTRAG_LLM_CACHE table if it doesn't exist"""
+        try:
+            # Check if chunk_id column exists
+            check_column_sql = """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'lightrag_llm_cache'
+            AND column_name = 'chunk_id'
+            """
+
+            column_info = await self.query(check_column_sql)
+            if not column_info:
+                logger.info("Adding chunk_id column to LIGHTRAG_LLM_CACHE table")
+                add_column_sql = """
+                ALTER TABLE LIGHTRAG_LLM_CACHE
+                ADD COLUMN chunk_id VARCHAR(255) NULL
+                """
+                await self.execute(add_column_sql)
+                logger.info(
+                    "Successfully added chunk_id column to LIGHTRAG_LLM_CACHE table"
+                )
+            else:
+                logger.info(
+                    "chunk_id column already exists in LIGHTRAG_LLM_CACHE table"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to add chunk_id column to LIGHTRAG_LLM_CACHE: {e}")
 
     async def _migrate_timestamp_columns(self):
         """Migrate timestamp columns in tables to timezone-aware types, assuming original data is in UTC time"""
@@ -203,6 +233,13 @@ class PostgreSQLDB:
             logger.error(f"PostgreSQL, Failed to migrate timestamp columns: {e}")
             # Don't throw an exception, allow the initialization process to continue
 
+        # Migrate LLM cache table to add chunk_id field if needed
+        try:
+            await self._migrate_llm_cache_add_chunk_id()
+        except Exception as e:
+            logger.error(f"PostgreSQL, Failed to migrate LLM cache chunk_id field: {e}")
+            # Don't throw an exception, allow the initialization process to continue
+
     async def query(
         self,
         sql: str,
@@ -253,25 +290,31 @@ class PostgreSQLDB:
         sql: str,
         data: dict[str, Any] | None = None,
         upsert: bool = False,
+        ignore_if_exists: bool = False,
         with_age: bool = False,
         graph_name: str | None = None,
     ):
         try:
             async with self.pool.acquire() as connection:  # type: ignore
                 if with_age and graph_name:
-                    await self.configure_age(connection, graph_name)  # type: ignore
+                    await self.configure_age(connection, graph_name)
                 elif with_age and not graph_name:
                     raise ValueError("Graph name is required when with_age is True")
 
                 if data is None:
-                    await connection.execute(sql)  # type: ignore
+                    await connection.execute(sql)
                 else:
-                    await connection.execute(sql, *data.values())  # type: ignore
+                    await connection.execute(sql, *data.values())
         except (
             asyncpg.exceptions.UniqueViolationError,
             asyncpg.exceptions.DuplicateTableError,
+            asyncpg.exceptions.DuplicateObjectError,  # Catch "already exists" error
+            asyncpg.exceptions.InvalidSchemaNameError,  # Also catch for AGE extension "already exists"
         ) as e:
-            if upsert:
+            if ignore_if_exists:
+                # If the flag is set, just ignore these specific errors
+                pass
+            elif upsert:
                 print("Key value duplicate, but upsert succeeded.")
             else:
                 logger.error(f"Upsert error: {e}")
@@ -298,7 +341,7 @@ class ClientManager:
                 "POSTGRES_PORT", config.get("postgres", "port", fallback=5432)
             ),
             "user": os.environ.get(
-                "POSTGRES_USER", config.get("postgres", "user", fallback=None)
+                "POSTGRES_USER", config.get("postgres", "user", fallback="postgres")
             ),
             "password": os.environ.get(
                 "POSTGRES_PASSWORD",
@@ -306,7 +349,7 @@ class ClientManager:
             ),
             "database": os.environ.get(
                 "POSTGRES_DATABASE",
-                config.get("postgres", "database", fallback=None),
+                config.get("postgres", "database", fallback="postgres"),
             ),
             "workspace": os.environ.get(
                 "POSTGRES_WORKSPACE",
@@ -314,7 +357,7 @@ class ClientManager:
             ),
             "max_connections": os.environ.get(
                 "POSTGRES_MAX_CONNECTIONS",
-                config.get("postgres", "max_connections", fallback=12),
+                config.get("postgres", "max_connections", fallback=20),
             ),
         }
 
@@ -497,6 +540,7 @@ class PGKVStorage(BaseKVStorage):
                         "original_prompt": v["original_prompt"],
                         "return_value": v["return"],
                         "mode": mode,
+                        "chunk_id": v.get("chunk_id"),
                     }
 
                     await self.db.execute(upsert_sql, _data)
@@ -1175,16 +1219,15 @@ class PGGraphStorage(BaseGraphStorage):
         ]
 
         for query in queries:
-            try:
-                await self.db.execute(
-                    query,
-                    upsert=True,
-                    with_age=True,
-                    graph_name=self.graph_name,
-                )
-                # logger.info(f"Successfully executed: {query}")
-            except Exception:
-                continue
+            # Use the new flag to silently ignore "already exists" errors
+            # at the source, preventing log spam.
+            await self.db.execute(
+                query,
+                upsert=True,
+                ignore_if_exists=True,  # Pass the new flag
+                with_age=True,
+                graph_name=self.graph_name,
+            )
 
     async def finalize(self):
         if self.db is not None:
@@ -1380,8 +1423,6 @@ class PGGraphStorage(BaseGraphStorage):
             # Process string result, parse it to JSON dictionary
             if isinstance(node_dict, str):
                 try:
-                    import json
-
                     node_dict = json.loads(node_dict)
                 except json.JSONDecodeError:
                     logger.warning(f"Failed to parse node string: {node_dict}")
@@ -1437,8 +1478,6 @@ class PGGraphStorage(BaseGraphStorage):
             # Process string result, parse it to JSON dictionary
             if isinstance(result, str):
                 try:
-                    import json
-
                     result = json.loads(result)
                 except json.JSONDecodeError:
                     logger.warning(f"Failed to parse edge string: {result}")
@@ -1655,8 +1694,6 @@ class PGGraphStorage(BaseGraphStorage):
                 # Process string result, parse it to JSON dictionary
                 if isinstance(node_dict, str):
                     try:
-                        import json
-
                         node_dict = json.loads(node_dict)
                     except json.JSONDecodeError:
                         logger.warning(
@@ -1664,10 +1701,11 @@ class PGGraphStorage(BaseGraphStorage):
                         )
 
                 # Remove the 'base' label if present in a 'labels' property
-                if "labels" in node_dict:
-                    node_dict["labels"] = [
-                        label for label in node_dict["labels"] if label != "base"
-                    ]
+                # if "labels" in node_dict:
+                #     node_dict["labels"] = [
+                #         label for label in node_dict["labels"] if label != "base"
+                #     ]
+
                 nodes_dict[result["node_id"]] = node_dict
 
         return nodes_dict
@@ -1796,14 +1834,14 @@ class PGGraphStorage(BaseGraphStorage):
         forward_query = f"""SELECT * FROM cypher('{self.graph_name}', $$
                      WITH [{src_array}] AS sources, [{tgt_array}] AS targets
                      UNWIND range(0, size(sources)-1) AS i
-                     MATCH (a:base {{entity_id: sources[i]}})-[r:DIRECTED]->(b:base {{entity_id: targets[i]}})
+                     MATCH (a:base {{entity_id: sources[i]}})-[r]->(b:base {{entity_id: targets[i]}})
                      RETURN sources[i] AS source, targets[i] AS target, properties(r) AS edge_properties
                    $$) AS (source text, target text, edge_properties agtype)"""
 
         backward_query = f"""SELECT * FROM cypher('{self.graph_name}', $$
                      WITH [{src_array}] AS sources, [{tgt_array}] AS targets
                      UNWIND range(0, size(sources)-1) AS i
-                     MATCH (a:base {{entity_id: sources[i]}})<-[r:DIRECTED]-(b:base {{entity_id: targets[i]}})
+                     MATCH (a:base {{entity_id: sources[i]}})<-[r]-(b:base {{entity_id: targets[i]}})
                      RETURN sources[i] AS source, targets[i] AS target, properties(r) AS edge_properties
                    $$) AS (source text, target text, edge_properties agtype)"""
 
@@ -1819,8 +1857,6 @@ class PGGraphStorage(BaseGraphStorage):
                 # Process string result, parse it to JSON dictionary
                 if isinstance(edge_props, str):
                     try:
-                        import json
-
                         edge_props = json.loads(edge_props)
                     except json.JSONDecodeError:
                         logger.warning(
@@ -1837,8 +1873,6 @@ class PGGraphStorage(BaseGraphStorage):
                 # Process string result, parse it to JSON dictionary
                 if isinstance(edge_props, str):
                     try:
-                        import json
-
                         edge_props = json.loads(edge_props)
                     except json.JSONDecodeError:
                         logger.warning(
@@ -1932,6 +1966,102 @@ class PGGraphStorage(BaseGraphStorage):
             if result and isinstance(result, dict) and "label" in result:
                 labels.append(result["label"])
         return labels
+
+    async def get_nodes_by_chunk_ids(self, chunk_ids: list[str]) -> list[dict]:
+        """
+        Retrieves nodes from the graph that are associated with a given list of chunk IDs.
+        This method uses a Cypher query with UNWIND to efficiently find all nodes
+        where the `source_id` property contains any of the specified chunk IDs.
+        """
+        # The string representation of the list for the cypher query
+        chunk_ids_str = json.dumps(chunk_ids)
+
+        query = f"""
+            SELECT * FROM cypher('{self.graph_name}', $$
+                UNWIND {chunk_ids_str} AS chunk_id
+                MATCH (n:base)
+                WHERE n.source_id IS NOT NULL AND chunk_id IN split(n.source_id, '{GRAPH_FIELD_SEP}')
+                RETURN n
+            $$) AS (n agtype);
+        """
+        results = await self._query(query)
+
+        # Build result list
+        nodes = []
+        for result in results:
+            if result["n"]:
+                node_dict = result["n"]["properties"]
+
+                # Process string result, parse it to JSON dictionary
+                if isinstance(node_dict, str):
+                    try:
+                        node_dict = json.loads(node_dict)
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            f"Failed to parse node string in batch: {node_dict}"
+                        )
+
+                node_dict["id"] = node_dict["entity_id"]
+                nodes.append(node_dict)
+
+        return nodes
+
+    async def get_edges_by_chunk_ids(self, chunk_ids: list[str]) -> list[dict]:
+        """
+        Retrieves edges from the graph that are associated with a given list of chunk IDs.
+        This method uses a Cypher query with UNWIND to efficiently find all edges
+        where the `source_id` property contains any of the specified chunk IDs.
+        """
+        chunk_ids_str = json.dumps(chunk_ids)
+
+        query = f"""
+            SELECT * FROM cypher('{self.graph_name}', $$
+                UNWIND {chunk_ids_str} AS chunk_id
+                MATCH (a:base)-[r]-(b:base)
+                WHERE r.source_id IS NOT NULL AND chunk_id IN split(r.source_id, '{GRAPH_FIELD_SEP}')
+                RETURN DISTINCT r, startNode(r) AS source, endNode(r) AS target
+            $$) AS (edge agtype, source agtype, target agtype);
+        """
+        results = await self._query(query)
+        edges = []
+        if results:
+            for item in results:
+                edge_agtype = item["edge"]["properties"]
+                # Process string result, parse it to JSON dictionary
+                if isinstance(edge_agtype, str):
+                    try:
+                        edge_agtype = json.loads(edge_agtype)
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            f"Failed to parse edge string in batch: {edge_agtype}"
+                        )
+
+                source_agtype = item["source"]["properties"]
+                # Process string result, parse it to JSON dictionary
+                if isinstance(source_agtype, str):
+                    try:
+                        source_agtype = json.loads(source_agtype)
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            f"Failed to parse node string in batch: {source_agtype}"
+                        )
+
+                target_agtype = item["target"]["properties"]
+                # Process string result, parse it to JSON dictionary
+                if isinstance(target_agtype, str):
+                    try:
+                        target_agtype = json.loads(target_agtype)
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            f"Failed to parse node string in batch: {target_agtype}"
+                        )
+
+                if edge_agtype and source_agtype and target_agtype:
+                    edge_properties = edge_agtype
+                    edge_properties["source"] = source_agtype["entity_id"]
+                    edge_properties["target"] = target_agtype["entity_id"]
+                    edges.append(edge_properties)
+        return edges
 
     async def _bfs_subgraph(
         self, node_label: str, max_depth: int, max_nodes: int
@@ -2357,6 +2487,7 @@ TABLES = {
 	                mode varchar(32) NOT NULL,
                     original_prompt TEXT,
                     return_value TEXT,
+                    chunk_id VARCHAR(255) NULL,
                     create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP,
 	                CONSTRAINT LIGHTRAG_LLM_CACHE_PK PRIMARY KEY (workspace, mode, id)
@@ -2389,10 +2520,10 @@ SQL_TEMPLATES = {
                                 chunk_order_index, full_doc_id, file_path
                                 FROM LIGHTRAG_DOC_CHUNKS WHERE workspace=$1 AND id=$2
                             """,
-    "get_by_id_llm_response_cache": """SELECT id, original_prompt, COALESCE(return_value, '') as "return", mode
+    "get_by_id_llm_response_cache": """SELECT id, original_prompt, COALESCE(return_value, '') as "return", mode, chunk_id
                                 FROM LIGHTRAG_LLM_CACHE WHERE workspace=$1 AND mode=$2
                                """,
-    "get_by_mode_id_llm_response_cache": """SELECT id, original_prompt, COALESCE(return_value, '') as "return", mode
+    "get_by_mode_id_llm_response_cache": """SELECT id, original_prompt, COALESCE(return_value, '') as "return", mode, chunk_id
                            FROM LIGHTRAG_LLM_CACHE WHERE workspace=$1 AND mode=$2 AND id=$3
                           """,
     "get_by_ids_full_docs": """SELECT id, COALESCE(content, '') as content
@@ -2402,7 +2533,7 @@ SQL_TEMPLATES = {
                                   chunk_order_index, full_doc_id, file_path
                                    FROM LIGHTRAG_DOC_CHUNKS WHERE workspace=$1 AND id IN ({ids})
                                 """,
-    "get_by_ids_llm_response_cache": """SELECT id, original_prompt, COALESCE(return_value, '') as "return", mode
+    "get_by_ids_llm_response_cache": """SELECT id, original_prompt, COALESCE(return_value, '') as "return", mode, chunk_id
                                  FROM LIGHTRAG_LLM_CACHE WHERE workspace=$1 AND mode= IN ({ids})
                                 """,
     "filter_keys": "SELECT id FROM {table_name} WHERE workspace=$1 AND id IN ({ids})",
@@ -2411,12 +2542,13 @@ SQL_TEMPLATES = {
                         ON CONFLICT (workspace,id) DO UPDATE
                            SET content = $2, update_time = CURRENT_TIMESTAMP
                        """,
-    "upsert_llm_response_cache": """INSERT INTO LIGHTRAG_LLM_CACHE(workspace,id,original_prompt,return_value,mode)
-                                      VALUES ($1, $2, $3, $4, $5)
+    "upsert_llm_response_cache": """INSERT INTO LIGHTRAG_LLM_CACHE(workspace,id,original_prompt,return_value,mode,chunk_id)
+                                      VALUES ($1, $2, $3, $4, $5, $6)
                                       ON CONFLICT (workspace,mode,id) DO UPDATE
                                       SET original_prompt = EXCLUDED.original_prompt,
                                       return_value=EXCLUDED.return_value,
                                       mode=EXCLUDED.mode,
+                                      chunk_id=EXCLUDED.chunk_id,
                                       update_time = CURRENT_TIMESTAMP
                                      """,
     "upsert_chunk": """INSERT INTO LIGHTRAG_DOC_CHUNKS (workspace, id, tokens,
