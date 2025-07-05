@@ -444,7 +444,18 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         for field in collection_info.get("fields", []):
             if field.get("name") == "vector":
                 field_type = field.get("type")
-                if field_type in ["FloatVector", "FLOAT_VECTOR"]:
+
+                # Extract type name from DataType enum or string
+                type_name = None
+                if hasattr(field_type, "name"):
+                    type_name = field_type.name
+                elif isinstance(field_type, str):
+                    type_name = field_type
+                else:
+                    type_name = str(field_type)
+
+                # Check if it's a vector type (supports multiple formats)
+                if type_name in ["FloatVector", "FLOAT_VECTOR"]:
                     existing_dimension = field.get("params", {}).get("dim")
 
                     if existing_dimension != current_dimension:
@@ -531,7 +542,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             # 2. Check schema compatibility
             self._check_schema_compatibility(collection_info)
 
-            logger.info(f"Collection {self.namespace} compatibility validation passed")
+            logger.info(
+                f"VectorDB Collection '{self.namespace}' compatibility validation passed"
+            )
 
         except Exception as e:
             logger.error(
@@ -546,12 +559,12 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             if not self._client.has_collection(self.namespace):
                 logger.error(f"Collection {self.namespace} does not exist")
                 raise ValueError(f"Collection {self.namespace} does not exist")
-            
+
             # Load the collection if it's not already loaded
             # In Milvus, collections need to be loaded before they can be searched
             self._client.load_collection(self.namespace)
             logger.debug(f"Collection {self.namespace} loaded successfully")
-            
+
         except Exception as e:
             logger.error(f"Failed to load collection {self.namespace}: {e}")
             raise
@@ -571,16 +584,13 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             # Check if our specific collection exists
             collection_exists = self._client.has_collection(self.namespace)
             logger.info(
-                f"Collection '{self.namespace}' exists check: {collection_exists}"
+                f"VectorDB collection '{self.namespace}' exists check: {collection_exists}"
             )
 
             if collection_exists:
                 # Double-check by trying to describe the collection
                 try:
                     self._client.describe_collection(self.namespace)
-                    logger.info(
-                        f"Collection '{self.namespace}' confirmed to exist, validating compatibility..."
-                    )
                     self._validate_collection_compatibility()
                     # Ensure the collection is loaded after validation
                     self._ensure_collection_loaded()
@@ -637,10 +647,10 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                     collection_name=self.namespace, schema=schema
                 )
                 self._create_indexes_after_collection()
-                
+
                 # Load the newly created collection
                 self._ensure_collection_loaded()
-                
+
                 logger.info(f"Successfully force-created collection {self.namespace}")
 
             except Exception as create_error:
@@ -731,7 +741,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
     ) -> list[dict[str, Any]]:
         # Ensure collection is loaded before querying
         self._ensure_collection_loaded()
-        
+
         embedding = await self.embedding_func(
             [query], _priority=5
         )  # higher priority for query
@@ -798,7 +808,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         try:
             # Ensure collection is loaded before querying
             self._ensure_collection_loaded()
-            
+
             # Search for relations where entity is either source or target
             expr = f'src_id == "{entity_name}" or tgt_id == "{entity_name}"'
 
@@ -839,7 +849,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         try:
             # Ensure collection is loaded before deleting
             self._ensure_collection_loaded()
-            
+
             # Delete vectors by IDs
             result = self._client.delete(collection_name=self.namespace, pks=ids)
 
@@ -865,7 +875,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         try:
             # Ensure collection is loaded before querying
             self._ensure_collection_loaded()
-            
+
             # Include all meta_fields (created_at is now always included) plus id
             output_fields = list(self.meta_fields) + ["id"]
 
@@ -899,7 +909,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         try:
             # Ensure collection is loaded before querying
             self._ensure_collection_loaded()
-            
+
             # Include all meta_fields (created_at is now always included) plus id
             output_fields = list(self.meta_fields) + ["id"]
 
