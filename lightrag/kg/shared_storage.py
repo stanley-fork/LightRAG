@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Union, TypeVar, Generic
 
 
 # Define a direct print function for critical logs that must be visible in all processes
-def direct_log(message, enable_output: bool = True, level: str = "DEBUG"):
+def direct_log(message, enable_output: bool = False, level: str = "DEBUG"):
     """
     Log a message directly to stderr to ensure visibility in all processes,
     including the Gunicorn master process.
@@ -27,15 +27,15 @@ def direct_log(message, enable_output: bool = True, level: str = "DEBUG"):
         current_level = logger.getEffectiveLevel()
     except ImportError:
         # Fallback if lightrag.utils is not available
-        current_level = logging.INFO
+        current_level = 20  # INFO
 
     # Convert string level to numeric level for comparison
     level_mapping = {
-        "DEBUG": logging.DEBUG,  # 10
-        "INFO": logging.INFO,  # 20
-        "WARNING": logging.WARNING,  # 30
-        "ERROR": logging.ERROR,  # 40
-        "CRITICAL": logging.CRITICAL,  # 50
+        "DEBUG": 10,  # DEBUG
+        "INFO": 20,  # INFO
+        "WARNING": 30,  # WARNING
+        "ERROR": 40,  # ERROR
+        "CRITICAL": 50,  # CRITICAL
     }
     message_level = level_mapping.get(level.upper(), logging.DEBUG)
 
@@ -340,6 +340,9 @@ def _perform_lock_cleanup(
         cleaned_count = 0
         new_earliest_time = None
 
+        # Calculate total count before cleanup
+        total_cleanup_len = len(cleanup_data)
+
         # Perform cleanup operation
         for cleanup_key, cleanup_time in list(cleanup_data.items()):
             if current_time - cleanup_time > CLEANUP_KEYED_LOCKS_AFTER_SECONDS:
@@ -369,7 +372,6 @@ def _perform_lock_cleanup(
                 else float("inf"),
                 MIN_CLEANUP_INTERVAL_SECONDS,
             )
-            total_cleanup_len = len(cleanup_data)
 
             if lock_type == "async":
                 direct_log(
@@ -711,16 +713,6 @@ class KeyedUnifiedLock:
             direct_log(
                 f"Error during async lock cleanup: {e}",
                 level="ERROR",
-                enable_output=False,
-            )
-
-        # Log cleanup results if any locks were cleaned
-        total_cleaned = cleanup_stats["mp_cleaned"] + cleanup_stats["async_cleaned"]
-        if total_cleaned > 0:
-            direct_log(
-                f"Keyed lock cleanup completed: {total_cleaned} locks cleaned "
-                f"(MP: {cleanup_stats['mp_cleaned']}, Async: {cleanup_stats['async_cleaned']})",
-                level="INFO",
                 enable_output=False,
             )
 
