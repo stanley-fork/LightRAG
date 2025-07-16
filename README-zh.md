@@ -135,6 +135,22 @@ pip install lightrag-hku
 
 ## 快速开始
 
+### LightRAG的LLM及配套技术栈要求
+
+LightRAG对大型语言模型（LLM）的能力要求远高于传统RAG，因为它需要LLM执行文档中的实体关系抽取任务。配置合适的Embedding和Reranker模型对提高查询表现也至关重要。
+
+- **LLM选型**：
+  - 推荐选用参数量至少为32B的LLM。
+  - 上下文长度至少为32KB，推荐达到64KB。
+- **Embedding模型**：
+  - 高性能的Embedding模型对RAG至关重要。
+  - 推荐使用主流的多语言Embedding模型，例如：BAAI/bge-m3 和 text-embedding-3-large。
+  - **重要提示**：在文档索引前必须确定使用的Embedding模型，且在文档查询阶段必须沿用与索引阶段相同的模型。
+- **Reranker模型配置**：
+  - 配置Reranker模型能够显著提升LightRAG的检索效果。
+  - 启用Reranker模型后，推荐将“mix模式”设为默认查询模式。
+  - 推荐选用主流的Reranker模型，例如：BAAI/bge-reranker-v2-m3 或 Jina 等服务商提供的模型。
+
 ### 使用LightRAG服务器
 
 **有关LightRAG服务器的更多信息，请参阅[LightRAG服务器](./lightrag/api/README.md)。**
