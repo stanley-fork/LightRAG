@@ -2721,22 +2721,32 @@ async def _find_related_text_unit_from_relationships(
     ]
     all_text_units_lookup = {}
 
-    async def fetch_chunk_data(c_id, index):
-        if c_id not in all_text_units_lookup:
-            chunk_data = await text_chunks_db.get_by_id(c_id)
-            # Only store valid data
-            if chunk_data is not None and "content" in chunk_data:
-                all_text_units_lookup[c_id] = {
-                    "data": chunk_data,
-                    "order": index,
-                }
-
-    tasks = []
+    # Deduplicate and preserve order | {c_id:order}
+    text_units_unique_flat = {}
     for index, unit_list in enumerate(text_units):
         for c_id in unit_list:
-            tasks.append(fetch_chunk_data(c_id, index))
+            if (
+                c_id not in text_units_unique_flat
+                or index < text_units_unique_flat[c_id]
+            ):
+                # Keep the smallest order
+                text_units_unique_flat[c_id] = index
 
-    await asyncio.gather(*tasks)
+    if not text_units_unique_flat:
+        logger.warning("No valid text chunks found")
+        return []
+
+    # Batch get all text chunk data
+    chunk_ids = list(text_units_unique_flat.keys())
+    chunk_data_list = await text_chunks_db.get_by_ids(chunk_ids)
+
+    # Build lookup table, handling possible missing data
+    for chunk_id, chunk_data in zip(chunk_ids, chunk_data_list):
+        if chunk_data is not None and "content" in chunk_data:
+            all_text_units_lookup[chunk_id] = {
+                "data": chunk_data,
+                "order": text_units_unique_flat[chunk_id],
+            }
 
     if not all_text_units_lookup:
         logger.warning("No valid text chunks found")
@@ -3155,7 +3165,7 @@ async def apply_rerank_if_enabled(
     retrieved_docs: list[dict],
     global_config: dict,
     enable_rerank: bool = True,
-    top_k: int = None,
+    top_n: int = None,
 ) -> list[dict]:
     """
     Apply reranking to retrieved documents if rerank is enabled.
@@ -3165,7 +3175,7 @@ async def apply_rerank_if_enabled(
         retrieved_docs: List of retrieved documents
         global_config: Global configuration containing rerank settings
         enable_rerank: Whether to enable reranking from query parameter
-        top_k: Number of top documents to return after reranking
+        top_n: Number of top documents to return after reranking
 
     Returns:
         Reranked documents if rerank is enabled, otherwise original documents
@@ -3182,18 +3192,18 @@ async def apply_rerank_if_enabled(
 
     try:
         logger.debug(
-            f"Applying rerank to {len(retrieved_docs)} documents, returning top {top_k}"
+            f"Applying rerank to {len(retrieved_docs)} documents, returning top {top_n}"
         )
 
         # Apply reranking - let rerank_model_func handle top_k internally
         reranked_docs = await rerank_func(
             query=query,
             documents=retrieved_docs,
-            top_k=top_k,
+            top_n=top_n,
         )
         if reranked_docs and len(reranked_docs) > 0:
-            if len(reranked_docs) > top_k:
-                reranked_docs = reranked_docs[:top_k]
+            if len(reranked_docs) > top_n:
+                reranked_docs = reranked_docs[:top_n]
             logger.info(
                 f"Successfully reranked {len(retrieved_docs)} documents to {len(reranked_docs)}"
             )
@@ -3253,7 +3263,7 @@ async def process_chunks_unified(
             retrieved_docs=unique_chunks,
             global_config=global_config,
             enable_rerank=query_param.enable_rerank,
-            top_k=rerank_top_k,
+            top_n=rerank_top_k,
         )
         logger.debug(f"Rerank: {len(unique_chunks)} chunks (source: {source_type})")
 
