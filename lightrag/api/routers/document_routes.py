@@ -1473,6 +1473,8 @@ def create_document_routes(
             storages = [
                 rag.text_chunks,
                 rag.full_docs,
+                rag.full_entities,
+                rag.full_relations,
                 rag.entities_vdb,
                 rag.relationships_vdb,
                 rag.chunks_vdb,
@@ -1506,7 +1508,11 @@ def create_document_routes(
                     logger.error(error_msg)
                     storage_error_count += 1
                 else:
-                    logger.info(f"Successfully dropped {storage_name}")
+                    namespace = storages[i].namespace
+                    workspace = storages[i].workspace
+                    logger.info(
+                        f"Successfully dropped {storage_name}: {workspace}/{namespace}"
+                    )
                     storage_success_count += 1
 
             # Log storage drop results
