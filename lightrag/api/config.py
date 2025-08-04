@@ -7,7 +7,11 @@ import argparse
 import logging
 from dotenv import load_dotenv
 from lightrag.utils import get_env_value
-from lightrag.llm.binding_options import OllamaEmbeddingOptions, OllamaLLMOptions
+from lightrag.llm.binding_options import (
+    OllamaEmbeddingOptions,
+    OllamaLLMOptions,
+    OpenAILLMOptions,
+)
 from lightrag.base import OllamaServerInfos
 import sys
 
@@ -239,6 +243,28 @@ def parse_args() -> argparse.Namespace:
     elif os.environ.get("EMBEDDING_BINDING") == "ollama":
         OllamaEmbeddingOptions.add_args(parser)
 
+    # Add OpenAI LLM options when llm-binding is openai or azure_openai
+    if "--llm-binding" in sys.argv:
+        try:
+            idx = sys.argv.index("--llm-binding")
+            if idx + 1 < len(sys.argv) and sys.argv[idx + 1] in [
+                "openai",
+                "azure_openai",
+            ]:
+                OpenAILLMOptions.add_args(parser)
+        except IndexError:
+            pass
+    elif os.environ.get("LLM_BINDING") in ["openai", "azure_openai"]:
+        OpenAILLMOptions.add_args(parser)
+
+    # Add global temperature command line argument
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=get_env_value("TEMPERATURE", DEFAULT_TEMPERATURE, float),
+        help="Global temperature setting for LLM (default: from env TEMPERATURE or 0.1)",
+    )
+
     args = parser.parse_args()
 
     # convert relative path to absolute path
@@ -297,8 +323,31 @@ def parse_args() -> argparse.Namespace:
     )
     args.enable_llm_cache = get_env_value("ENABLE_LLM_CACHE", True, bool)
 
-    # Inject LLM temperature configuration
-    args.temperature = get_env_value("TEMPERATURE", DEFAULT_TEMPERATURE, float)
+    # Handle Ollama LLM temperature with priority cascade when llm-binding is ollama
+    if args.llm_binding == "ollama":
+        # Priority order (highest to lowest):
+        # 1. --ollama-llm-temperature command argument
+        # 2. OLLAMA_LLM_TEMPERATURE environment variable
+        # 3. --temperature command argument
+        # 4. TEMPERATURE environment variable
+
+        # Check if --ollama-llm-temperature was explicitly provided in command line
+        if "--ollama-llm-temperature" not in sys.argv:
+            # Use args.temperature which handles --temperature command arg and TEMPERATURE env var priority
+            args.ollama_llm_temperature = args.temperature
+
+    # Handle OpenAI LLM temperature with priority cascade when llm-binding is openai or azure_openai
+    if args.llm_binding in ["openai", "azure_openai"]:
+        # Priority order (highest to lowest):
+        # 1. --openai-llm-temperature command argument
+        # 2. OPENAI_LLM_TEMPERATURE environment variable
+        # 3. --temperature command argument
+        # 4. TEMPERATURE environment variable
+
+        # Check if --openai-llm-temperature was explicitly provided in command line
+        if "--openai-llm-temperature" not in sys.argv:
+            # Use args.temperature which handles --temperature command arg and TEMPERATURE env var priority
+            args.openai_llm_temperature = args.temperature
 
     # Select Document loading tool (DOCLING, DEFAULT)
     args.document_loading_engine = get_env_value("DOCUMENT_LOADING_ENGINE", "DEFAULT")
