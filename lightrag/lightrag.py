@@ -530,10 +530,8 @@ class LightRAG:
         self._storages_status = StoragesStatus.CREATED
 
     async def initialize_storages(self):
-        """Asynchronously initialize the storages"""
+        """Storage initialization must be called one by one to prevent deadlock"""
         if self._storages_status == StoragesStatus.CREATED:
-            tasks = []
-
             for storage in (
                 self.full_docs,
                 self.text_chunks,
@@ -547,9 +545,8 @@ class LightRAG:
                 self.doc_status,
             ):
                 if storage:
-                    tasks.append(storage.initialize())
-
-            await asyncio.gather(*tasks)
+                    # logger.debug(f"Initializing storage: {storage}")
+                    await storage.initialize()
 
             self._storages_status = StoragesStatus.INITIALIZED
             logger.debug("All storage types initialized")
@@ -1229,6 +1226,9 @@ class LightRAG:
                     async with semaphore:
                         nonlocal processed_count
                         current_file_number = 0
+                        # Initialize to prevent UnboundLocalError in error handling
+                        first_stage_tasks = []
+                        entity_relation_task = None
                         try:
                             # Get file path from status document
                             file_path = getattr(
@@ -1348,15 +1348,13 @@ class LightRAG:
                                 )
                                 pipeline_status["history_messages"].append(error_msg)
 
-                                # Cancel tasks that are not yet completed
-                                all_tasks = first_stage_tasks + (
-                                    [entity_relation_task]
-                                    if entity_relation_task
-                                    else []
-                                )
-                                for task in all_tasks:
-                                    if task and not task.done():
-                                        task.cancel()
+                            # Cancel tasks that are not yet completed
+                            all_tasks = first_stage_tasks + (
+                                [entity_relation_task] if entity_relation_task else []
+                            )
+                            for task in all_tasks:
+                                if task and not task.done():
+                                    task.cancel()
 
                             # Persistent llm cache
                             if self.llm_response_cache:
