@@ -47,6 +47,8 @@ from .constants import (
     DEFAULT_MAX_TOTAL_TOKENS,
     DEFAULT_RELATED_CHUNK_NUMBER,
     DEFAULT_KG_CHUNK_PICK_METHOD,
+    DEFAULT_ENTITY_TYPES,
+    DEFAULT_SUMMARY_LANGUAGE,
 )
 from .kg.shared_storage import get_storage_keyed_lock
 import time
@@ -268,7 +270,7 @@ async def _summarize_descriptions(
     use_llm_func = partial(use_llm_func, _priority=8)
 
     language = global_config["addon_params"].get(
-        "language", PROMPTS["DEFAULT_LANGUAGE"]
+        "language", DEFAULT_SUMMARY_LANGUAGE
     )
 
     summary_length_recommended = global_config["summary_length_recommended"]
@@ -1650,11 +1652,9 @@ async def extract_entities(
 
     ordered_chunks = list(chunks.items())
     # add language and example number params to prompt
-    language = global_config["addon_params"].get(
-        "language", PROMPTS["DEFAULT_LANGUAGE"]
-    )
+    language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
     entity_types = global_config["addon_params"].get(
-        "entity_types", PROMPTS["DEFAULT_ENTITY_TYPES"]
+        "entity_types", DEFAULT_ENTITY_TYPES
     )
     example_number = global_config["addon_params"].get("example_number", None)
     if example_number and example_number < len(PROMPTS["entity_extraction_examples"]):
@@ -2115,7 +2115,7 @@ async def extract_keywords_only(
     else:
         examples = "\n".join(PROMPTS["keywords_extraction_examples"])
     language = global_config["addon_params"].get(
-        "language", PROMPTS["DEFAULT_LANGUAGE"]
+        "language", DEFAULT_SUMMARY_LANGUAGE
     )
 
     # 3. Process conversation history
