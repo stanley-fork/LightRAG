@@ -26,8 +26,8 @@ For a given text and a list of entity types, extract all entities and their rela
   - relationship_description: Explain the nature of the relationship between the source and target entities, providing a clear rationale for their connection
 4. Format each relationship as: (relationship{tuple_delimiter}<source_entity>{tuple_delimiter}<target_entity>{tuple_delimiter}<relationship_keywords>{tuple_delimiter}<relationship_description>)
 5. Use `{tuple_delimiter}` as field delimiter. Use `{record_delimiter}` as the entity or relation list delimiter.
-6. Return identified entities and relationships in {language}.
-7. Output `{completion_delimiter}` when all the entities and relationships are extracted.
+6. Output `{completion_delimiter}` when all the entities and relationships are extracted.
+7. Ensure the output language is {language}.
 
 ---Quality Guidelines---
 - Only extract entities and relationships that are clearly defined and meaningful in the context
@@ -56,8 +56,7 @@ Identify any missed entities or relationships in the last extraction task.
 1. Output the entities and realtionships in the same format as previous extraction task.
 2. Do not include entities and relations that have been previously extracted.
 3. If the entity doesn't clearly fit in any of`Entity_types` provided, classify it as "Other".
-4. Return identified entities and relationships in {language}.
-5. Output `{completion_delimiter}` when all the entities and relationships are extracted.
+4. Ensure the output language is {language}.
 
 ---Output---
 """
