@@ -2455,7 +2455,14 @@ async def process_chunks_unified(
             f"(chunk available tokens: {chunk_token_limit}, source: {source_type})"
         )
 
-    return unique_chunks
+    # 5. add id field to each chunk
+    final_chunks = []
+    for i, chunk in enumerate(unique_chunks):
+        chunk_with_id = chunk.copy()
+        chunk_with_id["id"] = f"DC{i + 1}"
+        final_chunks.append(chunk_with_id)
+
+    return final_chunks
 
 
 def build_file_path(already_file_paths, data_list, target):
@@ -2737,6 +2744,7 @@ def _convert_to_user_format(
             # Use original database data
             formatted_entities.append(
                 {
+                    "id": original_entity.get("id", "unknown"),
                     "entity_name": original_entity.get("entity_name", entity_name),
                     "entity_type": original_entity.get("entity_type", "UNKNOWN"),
                     "description": original_entity.get("description", ""),
@@ -2749,6 +2757,7 @@ def _convert_to_user_format(
             # Fallback to LLM context data (for backward compatibility)
             formatted_entities.append(
                 {
+                    "id": entity.get("id", "unknown"),
                     "entity_name": entity_name,
                     "entity_type": entity.get("type", "UNKNOWN"),
                     "description": entity.get("description", ""),
@@ -2774,6 +2783,7 @@ def _convert_to_user_format(
             # Use original database data
             formatted_relationships.append(
                 {
+                    "id": original_relation.get("id", "unknown"),
                     "src_id": original_relation.get("src_id", entity1),
                     "tgt_id": original_relation.get("tgt_id", entity2),
                     "description": original_relation.get("description", ""),
@@ -2788,6 +2798,7 @@ def _convert_to_user_format(
             # Fallback to LLM context data (for backward compatibility)
             formatted_relationships.append(
                 {
+                    "id": relation.get("id", "unknown"),
                     "src_id": entity1,
                     "tgt_id": entity2,
                     "description": relation.get("description", ""),
@@ -2803,6 +2814,7 @@ def _convert_to_user_format(
     formatted_chunks = []
     for i, chunk in enumerate(final_chunks):
         chunk_data = {
+            "id": chunk.get("id", "unknown"),
             "content": chunk.get("content", ""),
             "file_path": chunk.get("file_path", "unknown_source"),
             "chunk_id": chunk.get("chunk_id", ""),

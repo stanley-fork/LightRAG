@@ -2870,7 +2870,7 @@ async def _apply_token_truncation(
 
         entities_context.append(
             {
-                "id": i + 1,
+                "id": f"EN{i + 1}",
                 "entity": entity_name,
                 "type": entity.get("entity_type", "UNKNOWN"),
                 "description": entity.get("description", "UNKNOWN"),
@@ -2898,7 +2898,7 @@ async def _apply_token_truncation(
 
         relations_context.append(
             {
-                "id": i + 1,
+                "id": f"RE{i + 1}",
                 "entity1": entity1,
                 "entity2": entity2,
                 "description": relation.get("description", "UNKNOWN"),
@@ -2956,19 +2956,26 @@ async def _apply_token_truncation(
     filtered_entities = []
     filtered_entity_id_to_original = {}
     if entities_context:
-        final_entity_names = {e["entity"] for e in entities_context}
+        entity_name_to_id = {e["entity"]: e["id"] for e in entities_context}
+        final_entity_names = set(entity_name_to_id.keys())
         seen_nodes = set()
         for entity in final_entities:
             name = entity.get("entity_name")
             if name in final_entity_names and name not in seen_nodes:
-                filtered_entities.append(entity)
-                filtered_entity_id_to_original[name] = entity
+                entity_with_id = entity.copy()
+                entity_with_id["id"] = entity_name_to_id.get(name)
+
+                filtered_entities.append(entity_with_id)
+                filtered_entity_id_to_original[name] = entity_with_id
                 seen_nodes.add(name)
 
     filtered_relations = []
     filtered_relation_id_to_original = {}
     if relations_context:
-        final_relation_pairs = {(r["entity1"], r["entity2"]) for r in relations_context}
+        relation_pair_to_id = {
+            (r["entity1"], r["entity2"]): r["id"] for r in relations_context
+        }
+        final_relation_pairs = set(relation_pair_to_id.keys())
         seen_edges = set()
         for relation in final_relations:
             src, tgt = relation.get("src_id"), relation.get("tgt_id")
@@ -2977,8 +2984,11 @@ async def _apply_token_truncation(
 
             pair = (src, tgt)
             if pair in final_relation_pairs and pair not in seen_edges:
-                filtered_relations.append(relation)
-                filtered_relation_id_to_original[pair] = relation
+                relation_with_id = relation.copy()
+                relation_with_id["id"] = relation_pair_to_id.get(pair)
+
+                filtered_relations.append(relation_with_id)
+                filtered_relation_id_to_original[pair] = relation_with_id
                 seen_edges.add(pair)
 
     return {
@@ -3246,7 +3256,7 @@ async def _build_llm_context(
         for i, chunk in enumerate(truncated_chunks):
             text_units_context.append(
                 {
-                    "id": i + 1,
+                    "id": chunk["id"],
                     "content": chunk["content"],
                     "file_path": chunk.get("file_path", "unknown_source"),
                 }
@@ -4216,7 +4226,7 @@ async def naive_query(
     for i, chunk in enumerate(processed_chunks):
         text_units_context.append(
             {
-                "id": i + 1,
+                "id": chunk["id"],
                 "content": chunk["content"],
                 "file_path": chunk.get("file_path", "unknown_source"),
             }
