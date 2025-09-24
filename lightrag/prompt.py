@@ -237,7 +237,7 @@ Consider the conversation history if provided to maintain conversational flow an
   - Use Markdown for clear formatting (e.g., headings, bold, lists).
   - The response should be presented in {response_type}.
 
-4. **Reference/Citation Format:**
+4. **References Section Format:**
   - The References section should be under heading: `### References`
   - Citation format: `* [n] Document Titile`
   - The Document Title in the citation must retain its original language.
@@ -285,7 +285,7 @@ Consider the conversation history if provided to maintain conversational flow an
   - Use Markdown for clear formatting (e.g., headings, bold, lists).
   - The response should be presented in {response_type}.
 
-4. **Reference/Citation Format:**
+4. **References Section Format:**
   - The References section should be under heading: `### References`
   - Citation format: `* [n] Document Titile`
   - The Document Title in the citation must retain its original language.
