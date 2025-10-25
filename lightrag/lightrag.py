@@ -87,7 +87,7 @@ from lightrag.operate import (
     merge_nodes_and_edges,
     kg_query,
     naive_query,
-    _rebuild_knowledge_from_chunks,
+    rebuild_knowledge_from_chunks,
 )
 from lightrag.constants import GRAPH_FIELD_SEP
 from lightrag.utils import (
@@ -710,7 +710,7 @@ class LightRAG:
 
     async def check_and_migrate_data(self):
         """Check if data migration is needed and perform migration if necessary"""
-        async with get_data_init_lock(enable_logging=True):
+        async with get_data_init_lock():
             try:
                 # Check if migration is needed:
                 # 1. chunk_entity_relation_graph has entities and relations (count > 0)
@@ -3347,7 +3347,7 @@ class LightRAG:
             # 8. Rebuild entities and relationships from remaining chunks
             if entities_to_rebuild or relationships_to_rebuild:
                 try:
-                    await _rebuild_knowledge_from_chunks(
+                    await rebuild_knowledge_from_chunks(
                         entities_to_rebuild=entities_to_rebuild,
                         relationships_to_rebuild=relationships_to_rebuild,
                         knowledge_graph_inst=self.chunk_entity_relation_graph,
