@@ -1228,9 +1228,6 @@ async def _merge_entities_impl(
         existing_target_entity_data = await chunk_entity_relation_graph.get_node(
             target_entity
         )
-        logger.info(
-            "Entity Merge: target entity already exists, source and target entities will be merged"
-        )
 
     # 3. Merge entity data
     merged_entity_data = _merge_attributes(
@@ -1342,7 +1339,7 @@ async def _merge_entities_impl(
                 filter_none_only=True,  # Use relation behavior: only filter None
             )
             relation_updates[relation_key]["data"] = merged_relation
-            logger.info(
+            logger.debug(
                 f"Entity Merge: deduplicating relation `{normalized_src}`~`{normalized_tgt}`"
             )
         else:
@@ -1355,12 +1352,13 @@ async def _merge_entities_impl(
             }
 
     # Apply relationship updates
+    logger.info(f"Entity Merge: updatign {len(relation_updates)} relations")
     for rel_data in relation_updates.values():
         await chunk_entity_relation_graph.upsert_edge(
             rel_data["graph_src"], rel_data["graph_tgt"], rel_data["data"]
         )
         logger.info(
-            f"Entity Merge: updating relation `{rel_data['graph_src']}`->`{rel_data['graph_tgt']}`"
+            f"Entity Merge: updating relation `{rel_data['graph_src']}`~`{rel_data['graph_tgt']}`"
         )
 
     # Update relation chunk tracking storage
@@ -1378,12 +1376,15 @@ async def _merge_entities_impl(
 
             await relation_chunks_storage.upsert(updates)
             logger.info(
-                f"Entity Merge: merged chunk tracking for {len(updates)} relations"
+                f"Entity Merge: {len(updates)} relation chunk tracking records updated"
             )
 
     # 7. Update relationship vector representations
-    logger.info(f"Entity Merge: deleting {len(relations_to_delete)} relations from vdb")
+    logger.debug(
+        f"Entity Merge: deleting {len(relations_to_delete)} relations from vdb"
+    )
     await relationships_vdb.delete(relations_to_delete)
+
     for rel_data in relation_updates.values():
         edge_data = rel_data["data"]
         normalized_src = rel_data["norm_src"]
@@ -1410,7 +1411,11 @@ async def _merge_entities_impl(
             }
         }
         await relationships_vdb.upsert(relation_data_for_vdb)
-        logger.info(f"Entity Merge: updating vdb `{normalized_src}`~`{normalized_tgt}`")
+        logger.debug(
+            f"Entity Merge: updating vdb `{normalized_src}`~`{normalized_tgt}`"
+        )
+
+    logger.info(f"Entity Merge: {len(relation_updates)} relations in vdb updated")
 
     # 8. Update entity vector representation
     description = merged_entity_data.get("description", "")
