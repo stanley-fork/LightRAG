@@ -136,10 +136,6 @@ def on_exit(server):
     print("Gunicorn shutdown complete")
     print("=" * 80)
 
-    print("=" * 80)
-    print("Gunicorn shutdown complete")
-    print("=" * 80)
-
 
 def post_fork(server, worker):
     """
