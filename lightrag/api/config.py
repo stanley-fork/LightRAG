@@ -8,6 +8,7 @@ import logging
 from dotenv import load_dotenv
 from lightrag.utils import get_env_value
 from lightrag.llm.binding_options import (
+    GeminiEmbeddingOptions,
     GeminiLLMOptions,
     OllamaEmbeddingOptions,
     OllamaLLMOptions,
@@ -238,7 +239,15 @@ def parse_args() -> argparse.Namespace:
         "--embedding-binding",
         type=str,
         default=get_env_value("EMBEDDING_BINDING", "ollama"),
-        choices=["lollms", "ollama", "openai", "azure_openai", "aws_bedrock", "jina"],
+        choices=[
+            "lollms",
+            "ollama",
+            "openai",
+            "azure_openai",
+            "aws_bedrock",
+            "jina",
+            "gemini",
+        ],
         help="Embedding binding type (default: from env or ollama)",
     )
     parser.add_argument(
@@ -265,12 +274,19 @@ def parse_args() -> argparse.Namespace:
     if "--embedding-binding" in sys.argv:
         try:
             idx = sys.argv.index("--embedding-binding")
-            if idx + 1 < len(sys.argv) and sys.argv[idx + 1] == "ollama":
-                OllamaEmbeddingOptions.add_args(parser)
+            if idx + 1 < len(sys.argv):
+                if sys.argv[idx + 1] == "ollama":
+                    OllamaEmbeddingOptions.add_args(parser)
+                elif sys.argv[idx + 1] == "gemini":
+                    GeminiEmbeddingOptions.add_args(parser)
         except IndexError:
             pass
-    elif os.environ.get("EMBEDDING_BINDING") == "ollama":
-        OllamaEmbeddingOptions.add_args(parser)
+    else:
+        env_embedding_binding = os.environ.get("EMBEDDING_BINDING")
+        if env_embedding_binding == "ollama":
+            OllamaEmbeddingOptions.add_args(parser)
+        elif env_embedding_binding == "gemini":
+            GeminiEmbeddingOptions.add_args(parser)
 
     # Add OpenAI LLM options when llm-binding is openai or azure_openai
     if "--llm-binding" in sys.argv:
@@ -343,6 +359,7 @@ def parse_args() -> argparse.Namespace:
     args.llm_model = get_env_value("LLM_MODEL", "mistral-nemo:latest")
     args.embedding_model = get_env_value("EMBEDDING_MODEL", "bge-m3:latest")
     args.embedding_dim = get_env_value("EMBEDDING_DIM", 1024, int)
+    args.embedding_send_dim = get_env_value("EMBEDDING_SEND_DIM", False, bool)
 
     # Inject chunk configuration
     args.chunk_size = get_env_value("CHUNK_SIZE", 1200, int)
