@@ -499,6 +499,11 @@ async def _handle_single_relationship_extraction(
 
         # Process relationship description with same cleaning pipeline
         edge_description = sanitize_and_normalize_extracted_text(record_attributes[4])
+        if not edge_description.strip():
+            logger.warning(
+                f"Relationship extraction error: empty description for relation '{source}'~'{target}' in chunk '{chunk_key}'"
+            )
+            return None
 
         edge_source_id = chunk_key
         weight = (
@@ -1610,10 +1615,17 @@ async def _merge_nodes_then_upsert(
     # 1. Get existing node data from knowledge graph
     already_node = await knowledge_graph_inst.get_node(entity_name)
     if already_node:
-        already_entity_types.append(already_node["entity_type"])
-        already_source_ids.extend(already_node["source_id"].split(GRAPH_FIELD_SEP))
-        already_file_paths.extend(already_node["file_path"].split(GRAPH_FIELD_SEP))
-        already_description.extend(already_node["description"].split(GRAPH_FIELD_SEP))
+        already_entity_types.append(already_node.get("entity_type") or "UNKNOWN")
+
+        existing_source_id = already_node.get("source_id") or ""
+        already_source_ids.extend(existing_source_id.split(GRAPH_FIELD_SEP))
+
+        existing_file_path = already_node.get("file_path") or "unknown_source"
+        already_file_paths.extend(existing_file_path.split(GRAPH_FIELD_SEP))
+
+        existing_desc = (already_node.get("description") or "").strip()
+        if existing_desc:
+            already_description.extend(existing_desc.split(GRAPH_FIELD_SEP))
 
     new_source_ids = [dp["source_id"] for dp in nodes_data if dp.get("source_id")]
 
@@ -1720,8 +1732,11 @@ async def _merge_nodes_then_upsert(
     # Combine already_description with sorted new sorted descriptions
     description_list = already_description + sorted_descriptions
     if not description_list:
-        logger.error(f"Entity {entity_name} has no description")
-        raise ValueError(f"Entity {entity_name} has no description")
+        fallback_description = f"Entity {entity_name}"
+        logger.warning(
+            f"Entity `{entity_name}` has no description; fallback to `{fallback_description}`"
+        )
+        description_list = [fallback_description]
 
     # Check for cancellation before LLM summary
     if pipeline_status is not None and pipeline_status_lock is not None:
