@@ -415,6 +415,21 @@ async def _handle_single_entity_extraction(
             )
             return None
 
+        # Handle comma-separated entity types by finding the first non-empty token
+        if "," in entity_type:
+            original = entity_type
+            tokens = [t.strip() for t in entity_type.split(",")]
+            non_empty = [t for t in tokens if t]
+            if not non_empty:
+                logger.warning(
+                    f"Entity extraction error: all tokens empty after comma-split: '{original}'"
+                )
+                return None
+            entity_type = non_empty[0]
+            logger.warning(
+                f"Entity type contains comma, taking first non-empty token: '{original}' -> '{entity_type}'"
+            )
+
         # Remove spaces and convert to lowercase
         entity_type = entity_type.replace(" ", "").lower()
 
@@ -1615,7 +1630,24 @@ async def _merge_nodes_then_upsert(
     # 1. Get existing node data from knowledge graph
     already_node = await knowledge_graph_inst.get_node(entity_name)
     if already_node:
-        already_entity_types.append(already_node.get("entity_type") or "UNKNOWN")
+        existing_entity_type = already_node.get("entity_type")
+        # Coerce to str before any string operations: non-string values from
+        # API/custom graph paths would otherwise raise TypeError on the comma check.
+        if (
+            not isinstance(existing_entity_type, str)
+            or not existing_entity_type.strip()
+        ):
+            existing_entity_type = "UNKNOWN"
+        # Sanitize entity_type read back from DB to prevent dirty data from propagating
+        if "," in existing_entity_type:
+            original = existing_entity_type
+            tokens = [t.strip() for t in existing_entity_type.split(",")]
+            non_empty = [t for t in tokens if t]
+            existing_entity_type = non_empty[0] if non_empty else "UNKNOWN"
+            logger.warning(
+                f"Entity type read from DB contains comma, taking first non-empty token: '{original}' -> '{existing_entity_type}'"
+            )
+        already_entity_types.append(existing_entity_type)
 
         existing_source_id = already_node.get("source_id") or ""
         already_source_ids.extend(existing_source_id.split(GRAPH_FIELD_SEP))
