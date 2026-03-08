@@ -65,7 +65,7 @@ PRESET_VLLM_RERANKER=(
   "RERANK_BINDING=cohere"
   "LIGHTRAG_SETUP_RERANK_PROVIDER=vllm"
   "RERANK_MODEL=BAAI/bge-reranker-v2-m3"
-  "RERANK_BINDING_HOST=http://localhost:8000/v1/rerank"
+  "RERANK_BINDING_HOST=http://localhost:8000/rerank"
   "VLLM_RERANK_MODEL=BAAI/bge-reranker-v2-m3"
   "VLLM_RERANK_PORT=8000"
   "VLLM_RERANK_DEVICE=cpu"
@@ -152,7 +152,7 @@ reset_quick_start_inherited_state() {
     case "$key" in
       HOST|PORT|WEBUI_TITLE|WEBUI_DESCRIPTION|LLM_BINDING_API_KEY|EMBEDDING_BINDING_API_KEY)
         ;;
-      AUTH_ACCOUNTS|TOKEN_SECRET|TOKEN_EXPIRE_HOURS|GUEST_TOKEN_EXPIRE_HOURS|JWT_ALGORITHM|TOKEN_AUTO_RENEW|TOKEN_RENEW_THRESHOLD|LIGHTRAG_API_KEY|WHITELIST_PATHS|LANGFUSE_*|LIGHTRAG_SETUP_RERANK_PROVIDER|RERANK_*|VLLM_*|CUDA_VISIBLE_DEVICES|NVIDIA_VISIBLE_DEVICES|NVIDIA_DRIVER_CAPABILITIES)
+      AUTH_ACCOUNTS|TOKEN_SECRET|TOKEN_EXPIRE_HOURS|GUEST_TOKEN_EXPIRE_HOURS|JWT_ALGORITHM|TOKEN_AUTO_RENEW|TOKEN_RENEW_THRESHOLD|LIGHTRAG_API_KEY|WHITELIST_PATHS|LANGFUSE_*|CUDA_VISIBLE_DEVICES|NVIDIA_VISIBLE_DEVICES|NVIDIA_DRIVER_CAPABILITIES)
         unset "ENV_VALUES[$key]"
         ;;
     esac
@@ -517,35 +517,6 @@ add_docker_service() {
   fi
 }
 
-confirm_default_yes() {
-  local prompt="$1"
-  local response
-
-  read -r -p "$prompt [Y/n]: " response
-  case "${response,,}" in
-    n|no)
-      return 1
-      ;;
-    *)
-      return 0
-      ;;
-  esac
-}
-
-confirm_default_no() {
-  local prompt="$1"
-  local response
-
-  read -r -p "$prompt [y/N]: " response
-  case "${response,,}" in
-    y|yes)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
 
 prompt_choice() {
   local prompt="$1"
@@ -636,7 +607,7 @@ select_storage_backends() {
       break
     fi
 
-    if confirm "Proceed with these storage selections anyway?"; then
+    if confirm_default_no "Proceed with these storage selections anyway?"; then
       break
     fi
   done
@@ -696,7 +667,7 @@ collect_postgres_config() {
       use_docker="yes"
     fi
   else
-    if confirm "Add PostgreSQL service to docker-compose.yml?"; then
+    if confirm_default_no "Add PostgreSQL service to docker-compose.yml?"; then
       use_docker="yes"
     fi
   fi
@@ -746,7 +717,7 @@ collect_neo4j_config() {
       use_docker="yes"
     fi
   else
-    if confirm "Add Neo4j service to docker-compose.yml?"; then
+    if confirm_default_no "Add Neo4j service to docker-compose.yml?"; then
       use_docker="yes"
     fi
   fi
@@ -800,7 +771,7 @@ collect_mongodb_config() {
         use_docker="yes"
       fi
     else
-      if confirm "Add MongoDB service to docker-compose.yml?"; then
+      if confirm_default_no "Add MongoDB service to docker-compose.yml?"; then
         use_docker="yes"
       fi
     fi
@@ -842,7 +813,7 @@ collect_redis_config() {
       use_docker="yes"
     fi
   else
-    if confirm "Add Redis service to docker-compose.yml?"; then
+    if confirm_default_no "Add Redis service to docker-compose.yml?"; then
       use_docker="yes"
     fi
   fi
@@ -876,7 +847,7 @@ collect_milvus_config() {
       use_docker="yes"
     fi
   else
-    if confirm "Add Milvus service to docker-compose.yml?"; then
+    if confirm_default_no "Add Milvus service to docker-compose.yml?"; then
       use_docker="yes"
     fi
   fi
@@ -913,7 +884,7 @@ collect_qdrant_config() {
       use_docker="yes"
     fi
   else
-    if confirm "Add Qdrant service to docker-compose.yml?"; then
+    if confirm_default_no "Add Qdrant service to docker-compose.yml?"; then
       use_docker="yes"
     fi
   fi
@@ -947,7 +918,7 @@ collect_memgraph_config() {
       use_docker="yes"
     fi
   else
-    if confirm "Add Memgraph service to docker-compose.yml?"; then
+    if confirm_default_no "Add Memgraph service to docker-compose.yml?"; then
       use_docker="yes"
     fi
   fi
@@ -1001,7 +972,7 @@ collect_bedrock_credentials() {
     fi
   fi
 
-  if confirm "Store explicit AWS Bedrock credentials in .env?"; then
+  if confirm_default_no "Store explicit AWS Bedrock credentials in .env?"; then
     access_key="$(prompt_required_secret "AWS access key ID: ")"
     secret_key="$(prompt_required_secret "AWS secret access key: ")"
     session_token="$(mask_sensitive_input "AWS session token (optional): ")"
@@ -1257,7 +1228,7 @@ collect_rerank_config() {
   local reset_vllm_defaults="no"
   local rerank_default="${ENV_VALUES[LIGHTRAG_SETUP_RERANK_PROVIDER]:-${ENV_VALUES[RERANK_BINDING]:-cohere}}"
 
-  if ! confirm "Enable reranking?"; then
+  if ! confirm_default_no "Enable reranking?"; then
     ENV_VALUES["RERANK_BINDING"]="null"
     unset 'ENV_VALUES[LIGHTRAG_SETUP_RERANK_PROVIDER]'
     unset 'ENV_VALUES[RERANK_BINDING_API_KEY]'
@@ -1322,9 +1293,9 @@ collect_rerank_config() {
     fi
 
     default_model="$vllm_model"
-    default_host="$(default_loopback_url "$vllm_port" "/v1/rerank")"
+    default_host="$(default_loopback_url "$vllm_port" "/rerank")"
     if [[ "$use_docker" == "yes" ]]; then
-      set_compose_override "RERANK_BINDING_HOST" "http://vllm-rerank:${vllm_port}/v1/rerank"
+      set_compose_override "RERANK_BINDING_HOST" "http://vllm-rerank:${vllm_port}/rerank"
     else
       set_compose_override "RERANK_BINDING_HOST" ""
     fi
@@ -1363,7 +1334,12 @@ collect_rerank_config() {
   model="$(prompt_with_default "Rerank model" "$model_default")"
   host="$(prompt_with_default "Rerank endpoint" "$host_default")"
   if [[ "$binding_choice" == "vllm" ]]; then
-    api_key="$(prompt_secret_with_default "Rerank API key (optional): " "${ENV_VALUES[RERANK_BINDING_API_KEY]:-}")"
+    # Ensure a consistent key exists before prompting, generating one if needed.
+    local vllm_rerank_api_key="${ENV_VALUES[VLLM_RERANK_API_KEY]:-${ENV_VALUES[RERANK_BINDING_API_KEY]:-}}"
+    if [[ -z "$vllm_rerank_api_key" ]]; then
+      vllm_rerank_api_key="$(openssl rand -hex 16 2>/dev/null || LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32)"
+    fi
+    api_key="$(prompt_secret_with_default "Rerank API key (optional): " "$vllm_rerank_api_key")"
   else
     api_key="$(prompt_secret_until_valid_with_default "Rerank API key: " "${ENV_VALUES[RERANK_BINDING_API_KEY]:-}" validate_api_key "$binding")"
   fi
@@ -1380,7 +1356,13 @@ collect_rerank_config() {
   elif [[ "$reset_vllm_defaults" == "yes" ]]; then
     unset 'ENV_VALUES[RERANK_BINDING_HOST]'
   fi
-  store_optional_env_value "RERANK_BINDING_API_KEY" "$api_key"
+  if [[ "$binding_choice" == "vllm" ]]; then
+    # Keep VLLM_RERANK_API_KEY and RERANK_BINDING_API_KEY in sync.
+    ENV_VALUES["VLLM_RERANK_API_KEY"]="${api_key:-$vllm_rerank_api_key}"
+    store_optional_env_value "RERANK_BINDING_API_KEY" "${api_key:-$vllm_rerank_api_key}"
+  else
+    store_optional_env_value "RERANK_BINDING_API_KEY" "$api_key"
+  fi
 }
 
 collect_server_config() {
@@ -1437,7 +1419,7 @@ collect_security_config() {
       confirm_result=0
     fi
   else
-    if confirm "Configure authentication and API key settings?"; then
+    if confirm_default_no "Configure authentication and API key settings?"; then
       confirm_result=0
     fi
   fi
@@ -1499,7 +1481,7 @@ apply_clearable_env_value() {
 collect_observability_config() {
   local secret_key public_key host
 
-  if ! confirm "Enable Langfuse observability?"; then
+  if ! confirm_default_no "Enable Langfuse observability?"; then
     unset 'ENV_VALUES[LANGFUSE_ENABLE_TRACE]'
     unset 'ENV_VALUES[LANGFUSE_SECRET_KEY]'
     unset 'ENV_VALUES[LANGFUSE_PUBLIC_KEY]'
@@ -1546,7 +1528,7 @@ collect_docker_image_tags() {
     fi
   done
 
-  if confirm "Keep these image settings?"; then
+  if confirm_default_no "Keep these image settings?"; then
     return
   fi
 
@@ -1667,13 +1649,27 @@ finalize_setup() {
   if ((${#DOCKER_SERVICES[@]} > 0)); then
     generate_compose="yes"
   else
-    if confirm "Generate docker-compose for LightRAG only?"; then
+    if confirm_default_no "Generate docker-compose for LightRAG only?"; then
       generate_compose="yes"
     fi
   fi
 
   if [[ "$generate_compose" == "yes" ]]; then
     prepare_compose_env_overrides
+  fi
+
+  # When deploying with Docker, also normalize loopback URLs in ENV_VALUES so
+  # the generated .env reflects the correct host.docker.internal addresses.
+  # (The compose environment section overrides these at runtime, but having the
+  # correct value in .env provides a reliable fallback and avoids confusion.)
+  if ((${#DOCKER_SERVICES[@]} > 0)); then
+    local _norm_key _norm_val
+    for _norm_key in "LLM_BINDING_HOST" "EMBEDDING_BINDING_HOST" "RERANK_BINDING_HOST"; do
+      if [[ -n "${ENV_VALUES[$_norm_key]:-}" ]]; then
+        _norm_val="$(normalize_loopback_uri_for_compose "${ENV_VALUES[$_norm_key]}")"
+        ENV_VALUES["$_norm_key"]="$_norm_val"
+      fi
+    done
   fi
 
   backup_path="$(backup_env_file)"
@@ -1707,13 +1703,14 @@ finalize_setup() {
     compose_suffix="${DEPLOYMENT_TYPE:-custom}"
     compose_file="${REPO_ROOT}/docker-compose.${compose_suffix}.yml"
     if [[ -f "$compose_file" ]]; then
-      if ! confirm "Overwrite existing ${compose_file}?"; then
+      if ! confirm_default_yes "Overwrite existing ${compose_file}?"; then
         compose_file="${REPO_ROOT}/docker-compose.${compose_suffix}.$(date +%Y%m%d_%H%M%S).yml"
         log_warn "Using new compose file: $compose_file"
       fi
     fi
     generate_docker_compose "$compose_file"
     log_success "Wrote ${compose_file}"
+    echo "  To start later: docker compose -f ${compose_file} up -d"
     if confirm_default_no "Start docker services now?"; then
       if ! check_docker_availability; then
         return 1
@@ -1875,7 +1872,14 @@ quick_start_vllm_flow() {
   apply_preset "${PRESET_DEVELOPMENT[@]:4:3}"
   # Embedding: always overwrite with vLLM preset (cpu defaults; adjusted below)
   apply_preset_overwrite "${PRESET_VLLM_EMBEDDING[@]}"
-  unset 'ENV_VALUES[EMBEDDING_BINDING_API_KEY]'
+  # Sync the vLLM API key to the client-side binding key so both sides use
+  # the same value.  Generate a random key when neither is already set.
+  local vllm_embed_api_key="${ENV_VALUES[VLLM_EMBED_API_KEY]:-${ENV_VALUES[EMBEDDING_BINDING_API_KEY]:-}}"
+  if [[ -z "$vllm_embed_api_key" ]]; then
+    vllm_embed_api_key="$(openssl rand -hex 16 2>/dev/null || LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32)"
+  fi
+  ENV_VALUES["VLLM_EMBED_API_KEY"]="$vllm_embed_api_key"
+  ENV_VALUES["EMBEDDING_BINDING_API_KEY"]="$vllm_embed_api_key"
 
   DEPLOYMENT_TYPE="development"
   clear_bedrock_credentials_if_unused
@@ -1922,9 +1926,17 @@ quick_start_vllm_flow() {
     apply_preset_overwrite "${PRESET_VLLM_RERANKER[@]}"
     ENV_VALUES["VLLM_RERANK_DEVICE"]="$vllm_device"
     ENV_VALUES["VLLM_RERANK_DTYPE"]="$vllm_dtype"
+    # Sync the vLLM rerank API key to the client-side binding key.
+    # Generate a random key when neither is already set.
+    local vllm_rerank_api_key="${ENV_VALUES[VLLM_RERANK_API_KEY]:-${ENV_VALUES[RERANK_BINDING_API_KEY]:-}}"
+    if [[ -z "$vllm_rerank_api_key" ]]; then
+      vllm_rerank_api_key="$(openssl rand -hex 16 2>/dev/null || LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32)"
+    fi
+    ENV_VALUES["VLLM_RERANK_API_KEY"]="$vllm_rerank_api_key"
+    ENV_VALUES["RERANK_BINDING_API_KEY"]="$vllm_rerank_api_key"
     add_docker_service "vllm-rerank"
     set_compose_override "RERANK_BINDING_HOST" \
-      "http://vllm-rerank:${ENV_VALUES[VLLM_RERANK_PORT]:-8000}/v1/rerank"
+      "http://vllm-rerank:${ENV_VALUES[VLLM_RERANK_PORT]:-8000}/rerank"
   else
     local key
     for key in "${!ENV_VALUES[@]}"; do
