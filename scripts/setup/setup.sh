@@ -21,6 +21,8 @@ declare -a DOCKER_SERVICES
 SSL_CERT_SOURCE_PATH=""
 SSL_KEY_SOURCE_PATH=""
 DEPLOYMENT_TYPE=""
+LIGHTRAG_COMPOSE_SERVER_PORT_MAPPING=""
+NORMALIZED_SERVER_HOST_FOR_COMPOSE=""
 DEBUG="${DEBUG:-false}"
 
 PRESET_VLLM_EMBEDDING=(
@@ -100,6 +102,8 @@ reset_state() {
   SSL_CERT_SOURCE_PATH=""
   SSL_KEY_SOURCE_PATH=""
   DEPLOYMENT_TYPE=""
+  LIGHTRAG_COMPOSE_SERVER_PORT_MAPPING=""
+  NORMALIZED_SERVER_HOST_FOR_COMPOSE=""
 }
 
 validate_runtime_target() {
@@ -232,75 +236,6 @@ wait_for_port() {
   done
 }
 
-wait_for_services() {
-  local service
-  local host="127.0.0.1"
-  local port=""
-  local failures=()
-
-  for service in "${DOCKER_SERVICES[@]}"; do
-    case "$service" in
-      postgres)
-        port="${ENV_VALUES[POSTGRES_HOST_PORT]:-${ENV_VALUES[POSTGRES_PORT]:-5432}}"
-        ;;
-      neo4j)
-        port="7687"
-        ;;
-      mongodb)
-        port="27017"
-        ;;
-      redis)
-        port="6379"
-        ;;
-      milvus)
-        port="19530"
-        ;;
-      qdrant)
-        port="6333"
-        ;;
-      memgraph)
-        port="7687"
-        ;;
-      vllm-rerank)
-        port="${ENV_VALUES[VLLM_RERANK_PORT]:-8000}"
-        ;;
-      vllm-embed)
-        port="${ENV_VALUES[VLLM_EMBED_PORT]:-8001}"
-        ;;
-      *)
-        port=""
-        ;;
-    esac
-
-    if [[ -n "$port" ]]; then
-      if ! wait_for_port "$host" "$port" "$service"; then
-        failures+=("$service")
-      fi
-    fi
-  done
-
-  if ((${#failures[@]} > 0)); then
-    format_error \
-      "Some docker services did not become ready: ${failures[*]}" \
-      "Inspect 'docker compose ps' and service logs, then rerun setup after fixing the failing services."
-    return 1
-  fi
-}
-
-wait_for_lightrag_service() {
-  local compose_file="$1"
-  local port="${ENV_VALUES[PORT]:-9621}"
-
-  if wait_for_port "127.0.0.1" "$port" "lightrag"; then
-    return 0
-  fi
-
-  format_error \
-    "LightRAG did not become ready on 127.0.0.1:${port}." \
-    "Inspect 'docker compose -f ${compose_file} ps' and 'docker compose -f ${compose_file} logs lightrag' before retrying."
-  return 1
-}
-
 normalize_loopback_uri_for_compose() {
   local uri="$1"
 
@@ -400,14 +335,31 @@ normalize_loopback_host_for_compose() {
 }
 
 normalize_server_host_for_compose() {
-  local host="$1"
+  local host="${1:-}"
+  local published_host="$host"
+  local published_port="${ENV_VALUES[PORT]:-9621}"
 
-  if [[ -n "$host" && "$host" != "0.0.0.0" ]]; then
-    printf '0.0.0.0'
-    return 0
+  if [[ -z "$published_host" ]]; then
+    published_host="0.0.0.0"
+  elif [[ "$published_host" == "localhost" ]]; then
+    published_host="127.0.0.1"
   fi
 
-  printf '%s' "$host"
+  if [[ -z "$published_port" ]]; then
+    published_port="9621"
+  fi
+
+  LIGHTRAG_COMPOSE_SERVER_PORT_MAPPING="${published_host}:${published_port}:9621"
+
+  if [[ -z "${COMPOSE_ENV_OVERRIDES[PORT]+set}" ]]; then
+    if [[ "$published_port" != "9621" ]]; then
+      set_compose_override "PORT" "9621"
+    else
+      set_compose_override "PORT" ""
+    fi
+  fi
+
+  NORMALIZED_SERVER_HOST_FOR_COMPOSE="0.0.0.0"
 }
 
 default_loopback_url() {
@@ -528,20 +480,12 @@ prepare_compose_runtime_overrides() {
     fi
   done
 
-  for key in "HOST"; do
-    if [[ -n "${COMPOSE_ENV_OVERRIDES[$key]+set}" ]]; then
-      continue
+  if [[ -n "${ENV_VALUES[HOST]:-}" || -n "${ENV_VALUES[PORT]:-}" ]]; then
+    normalize_server_host_for_compose "${ENV_VALUES[HOST]:-0.0.0.0}"
+    normalized_value="$NORMALIZED_SERVER_HOST_FOR_COMPOSE"
+    if [[ -z "${COMPOSE_ENV_OVERRIDES[HOST]+set}" && "$normalized_value" != "${ENV_VALUES[HOST]:-0.0.0.0}" ]]; then
+      set_compose_override "HOST" "$normalized_value"
     fi
-    if [[ -n "${ENV_VALUES[$key]:-}" ]]; then
-      normalized_value="$(normalize_server_host_for_compose "${ENV_VALUES[$key]}")"
-      if [[ "$normalized_value" != "${ENV_VALUES[$key]}" ]]; then
-        set_compose_override "$key" "$normalized_value"
-      fi
-    fi
-  done
-
-  if [[ -z "${COMPOSE_ENV_OVERRIDES[PORT]+set}" && -n "${ENV_VALUES[PORT]:-}" && "${ENV_VALUES[PORT]}" != "9621" ]]; then
-    set_compose_override "PORT" "9621"
   fi
 }
 
@@ -1231,10 +1175,13 @@ collect_embedding_config() {
 
 collect_rerank_config() {
   # Pass "yes" to skip the "Enable reranking?" prompt (caller already asked it).
+  # The optional second argument can force the Docker choice to "yes" or "no".
   local skip_enable_check="${1:-no}"
+  local docker_choice_override="${2:-prompt}"
   local options=("cohere" "jina" "aliyun" "vllm")
   local binding_choice binding model host api_key
   local vllm_model vllm_port vllm_device vllm_extra
+  local vllm_host_default=""
   local default_model="" default_host="" model_default="" host_default="" use_docker="no"
   local previous_provider="${ENV_VALUES[LIGHTRAG_SETUP_RERANK_PROVIDER]:-}"
   local reset_vllm_defaults="no"
@@ -1272,23 +1219,26 @@ collect_rerank_config() {
   fi
 
   if [[ "$binding_choice" == "vllm" ]]; then
-    log_info "vLLM uses the Cohere-compatible rerank API."
-    if confirm_default_yes "Run rerank service locally via Docker?"; then
-      add_docker_service "vllm-rerank"
+    if [[ "$docker_choice_override" == "yes" || "$docker_choice_override" == "no" ]]; then
+      use_docker="$docker_choice_override"
+    elif confirm_default_yes "Run rerank service locally via Docker?"; then
       use_docker="yes"
     fi
-    vllm_model="$(prompt_with_default "vLLM rerank model" "${ENV_VALUES[VLLM_RERANK_MODEL]:-BAAI/bge-reranker-v2-m3}")"
-    vllm_port="$(prompt_until_valid "vLLM rerank port" "${ENV_VALUES[VLLM_RERANK_PORT]:-8000}" validate_port)"
-    vllm_device="$(prompt_choice "vLLM device" "${ENV_VALUES[VLLM_RERANK_DEVICE]:-cpu}" "cpu" "cuda")"
-    if [[ "$vllm_device" == "cuda" ]] && ! command -v nvidia-smi >/dev/null 2>&1; then
-      log_warn "CUDA device selected but no NVIDIA driver detected on host."
-      if confirm_default_yes "Use CPU instead?"; then
-        vllm_device="cpu"
+    if [[ "$use_docker" == "yes" ]]; then
+      add_docker_service "vllm-rerank"
+      vllm_model="$(prompt_with_default "vLLM rerank model" "${ENV_VALUES[VLLM_RERANK_MODEL]:-BAAI/bge-reranker-v2-m3}")"
+      vllm_port="$(prompt_until_valid "vLLM rerank port" "${ENV_VALUES[VLLM_RERANK_PORT]:-8000}" validate_port)"
+      vllm_device="$(prompt_choice "vLLM device" "${ENV_VALUES[VLLM_RERANK_DEVICE]:-cpu}" "cpu" "cuda")"
+      if [[ "$vllm_device" == "cuda" ]] && ! command -v nvidia-smi >/dev/null 2>&1; then
+        log_warn "CUDA device selected but no NVIDIA driver detected on host."
+        if confirm_default_yes "Use CPU instead?"; then
+          vllm_device="cpu"
+        fi
       fi
+      vllm_extra="$(prompt_with_default "vLLM extra args" "${ENV_VALUES[VLLM_RERANK_EXTRA_ARGS]:-}")"
     fi
-    vllm_extra="$(prompt_with_default "vLLM extra args" "${ENV_VALUES[VLLM_RERANK_EXTRA_ARGS]:-}")"
 
-    if [[ "$vllm_device" == "cuda" ]]; then
+    if [[ "$use_docker" == "yes" && "$vllm_device" == "cuda" ]]; then
       if [[ "${ENV_VALUES[CUDA_VISIBLE_DEVICES]:-}" == "-1" ]]; then
         unset 'ENV_VALUES[CUDA_VISIBLE_DEVICES]'
       fi
@@ -1298,18 +1248,23 @@ collect_rerank_config() {
       unset 'ENV_VALUES[VLLM_USE_CPU]'
     fi
 
-    ENV_VALUES["VLLM_RERANK_MODEL"]="$vllm_model"
-    ENV_VALUES["VLLM_RERANK_PORT"]="$vllm_port"
-    ENV_VALUES["VLLM_RERANK_DEVICE"]="$vllm_device"
-    if [[ -n "$vllm_extra" ]]; then
-      ENV_VALUES["VLLM_RERANK_EXTRA_ARGS"]="$vllm_extra"
+    if [[ "$use_docker" == "yes" ]]; then
+      ENV_VALUES["VLLM_RERANK_MODEL"]="$vllm_model"
+      ENV_VALUES["VLLM_RERANK_PORT"]="$vllm_port"
+      ENV_VALUES["VLLM_RERANK_DEVICE"]="$vllm_device"
+      if [[ -n "$vllm_extra" ]]; then
+        ENV_VALUES["VLLM_RERANK_EXTRA_ARGS"]="$vllm_extra"
+      fi
     fi
 
-    default_model="$vllm_model"
-    default_host="$(default_loopback_url "$vllm_port" "/rerank")"
     if [[ "$use_docker" == "yes" ]]; then
+      default_model="$vllm_model"
+      default_host="$(default_loopback_url "$vllm_port" "/rerank")"
       set_compose_override "RERANK_BINDING_HOST" "http://vllm-rerank:${vllm_port}/rerank"
     else
+      default_model="${ENV_VALUES[RERANK_MODEL]:-${ENV_VALUES[VLLM_RERANK_MODEL]:-BAAI/bge-reranker-v2-m3}}"
+      vllm_host_default="$(default_loopback_url "${ENV_VALUES[VLLM_RERANK_PORT]:-8000}" "/rerank")"
+      default_host="${ENV_VALUES[RERANK_BINDING_HOST]:-$vllm_host_default}"
       set_compose_override "RERANK_BINDING_HOST" ""
     fi
     binding="cohere"
@@ -1323,22 +1278,25 @@ collect_rerank_config() {
   elif [[ "$reset_vllm_defaults" == "yes" ]]; then
     case "$binding_choice" in
       cohere)
-        model_default="rerank-v3.5"
-        host_default="https://api.cohere.com/v2/rerank"
+        default_model="rerank-v3.5"
+        default_host="https://api.cohere.com/v2/rerank"
         ;;
       jina)
-        model_default="jina-reranker-v2-base-multilingual"
-        host_default="https://api.jina.ai/v1/rerank"
+        default_model="jina-reranker-v2-base-multilingual"
+        default_host="https://api.jina.ai/v1/rerank"
         ;;
       aliyun)
-        model_default="gte-rerank-v2"
-        host_default="https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
+        default_model="gte-rerank-v2"
+        default_host="https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
         ;;
       *)
-        model_default=""
-        host_default=""
+        default_model=""
+        default_host=""
         ;;
     esac
+    # Switching away from local vLLM should replace stale localhost/model values.
+    model_default="$default_model"
+    host_default="$default_host"
   else
     model_default="${ENV_VALUES[RERANK_MODEL]:-$default_model}"
     host_default="${ENV_VALUES[RERANK_BINDING_HOST]:-$default_host}"
@@ -1358,7 +1316,13 @@ collect_rerank_config() {
   fi
 
   ENV_VALUES["RERANK_BINDING"]="$binding"
-  ENV_VALUES["LIGHTRAG_SETUP_RERANK_PROVIDER"]="$binding_choice"
+  # Only keep the setup marker for wizard-managed local Docker vLLM rerank.
+  # Host-managed or remote rerank endpoints should rely on RERANK_BINDING alone.
+  if [[ "$binding_choice" == "vllm" && "$use_docker" == "yes" ]]; then
+    ENV_VALUES["LIGHTRAG_SETUP_RERANK_PROVIDER"]="vllm"
+  else
+    unset 'ENV_VALUES[LIGHTRAG_SETUP_RERANK_PROVIDER]'
+  fi
   if [[ -n "$model" ]]; then
     ENV_VALUES["RERANK_MODEL"]="$model"
   elif [[ "$reset_vllm_defaults" == "yes" ]]; then
@@ -1394,14 +1358,32 @@ collect_server_config() {
 
 collect_ssl_config() {
   local cert key
+  local ssl_enabled_default="no"
 
-  if ! confirm_default_yes "Enable SSL/TLS for the API server?"; then
-    unset 'ENV_VALUES[SSL]'
-    unset 'ENV_VALUES[SSL_CERTFILE]'
-    unset 'ENV_VALUES[SSL_KEYFILE]'
-    SSL_CERT_SOURCE_PATH=""
-    SSL_KEY_SOURCE_PATH=""
-    return
+  case "${ENV_VALUES[SSL]:-}" in
+    true|TRUE|True|1|yes|YES|Yes|y|Y|on|ON|On|t|T)
+      ssl_enabled_default="yes"
+      ;;
+  esac
+
+  if [[ "$ssl_enabled_default" == "yes" ]]; then
+    if ! confirm_default_yes "Enable SSL/TLS for the API server?"; then
+      unset 'ENV_VALUES[SSL]'
+      unset 'ENV_VALUES[SSL_CERTFILE]'
+      unset 'ENV_VALUES[SSL_KEYFILE]'
+      SSL_CERT_SOURCE_PATH=""
+      SSL_KEY_SOURCE_PATH=""
+      return
+    fi
+  else
+    if ! confirm_default_no "Enable SSL/TLS for the API server?"; then
+      unset 'ENV_VALUES[SSL]'
+      unset 'ENV_VALUES[SSL_CERTFILE]'
+      unset 'ENV_VALUES[SSL_KEYFILE]'
+      SSL_CERT_SOURCE_PATH=""
+      SSL_KEY_SOURCE_PATH=""
+      return
+    fi
   fi
 
   cert="$(prompt_until_valid "SSL certificate file" "${ENV_VALUES[SSL_CERTFILE]:-}" validate_existing_file)"
@@ -1596,120 +1578,6 @@ prepare_inherited_ssl_assets_for_compose() {
   fi
 }
 
-finalize_setup() {
-  local backup_path
-  local compose_suffix
-  local compose_file
-  local generate_compose="no"
-
-  if [[ ! -f "${REPO_ROOT}/env.example" ]]; then
-    format_error "env.example is missing in $REPO_ROOT" "Restore env.example before running setup."
-    return 1
-  fi
-
-  if [[ ! -w "$REPO_ROOT" ]]; then
-    format_error "No write permission in $REPO_ROOT" "Run the setup from a writable directory."
-    return 1
-  fi
-
-  if [[ -n "${ENV_VALUES[LIGHTRAG_KV_STORAGE]:-}" ]]; then
-    if ! validate_required_variables \
-      "${ENV_VALUES[LIGHTRAG_KV_STORAGE]}" \
-      "${ENV_VALUES[LIGHTRAG_VECTOR_STORAGE]}" \
-      "${ENV_VALUES[LIGHTRAG_GRAPH_STORAGE]}" \
-      "${ENV_VALUES[LIGHTRAG_DOC_STATUS_STORAGE]}"; then
-      return 1
-    fi
-  fi
-
-  if ! validate_mongo_vector_storage_config \
-    "${ENV_VALUES[LIGHTRAG_VECTOR_STORAGE]:-}" \
-    "${ENV_VALUES[MONGO_URI]:-}"; then
-    return 1
-  fi
-
-  if ! validate_security_config \
-    "${ENV_VALUES[AUTH_ACCOUNTS]:-}" \
-    "${ENV_VALUES[TOKEN_SECRET]:-}" \
-    "${ENV_VALUES[LIGHTRAG_API_KEY]:-}"; then
-    return 1
-  fi
-
-  if ! validate_sensitive_env_literals; then
-    return 1
-  fi
-
-  show_summary
-
-  if ! confirm_default_yes "Next step will generate the .env file. Ready to proceed or cancel?"; then
-    log_warn "Setup cancelled."
-    return 1
-  fi
-
-  if ((${#DOCKER_SERVICES[@]} > 0)); then
-    generate_compose="yes"
-  else
-    if confirm_default_no "Generate docker-compose for LightRAG only?"; then
-      generate_compose="yes"
-    fi
-  fi
-
-  if [[ "$generate_compose" == "yes" ]]; then
-    if ! prepare_inherited_ssl_assets_for_compose "$existing_compose"; then
-      return 1
-    fi
-    prepare_compose_env_overrides
-  fi
-
-  # When deploying with Docker, the BINDING_HOST in .env is overridden by the compose environment section
-  # to point to the appropriate hostname instead of localhost
-  # (e.g., host.docker.internal or the service name in the compose network)
-
-  backup_path="$(backup_env_file)"
-  if [[ -n "$backup_path" ]]; then
-    log_success "Backed up existing .env to $backup_path"
-  fi
-
-  if [[ -n "$SSL_CERT_SOURCE_PATH" ]] && ! validate_existing_file "$SSL_CERT_SOURCE_PATH"; then
-    format_error \
-      "Invalid SSL_CERTFILE" \
-      "Set it to an existing certificate file, disable SSL, or rerun the full setup to choose a new certificate."
-    return 1
-  fi
-
-  if [[ -n "$SSL_KEY_SOURCE_PATH" ]] && ! validate_existing_file "$SSL_KEY_SOURCE_PATH"; then
-    format_error \
-      "Invalid SSL_KEYFILE" \
-      "Set it to an existing private key file, disable SSL, or rerun the full setup to choose a new key."
-    return 1
-  fi
-
-  if [[ -n "$SSL_CERT_SOURCE_PATH" || -n "$SSL_KEY_SOURCE_PATH" ]]; then
-    stage_ssl_assets "$SSL_CERT_SOURCE_PATH" "$SSL_KEY_SOURCE_PATH"
-  fi
-
-  log_debug "Writing .env to ${REPO_ROOT}/.env"
-  clear_deprecated_vllm_dtype_state
-  generate_env_file "${REPO_ROOT}/env.example" "${REPO_ROOT}/.env"
-  log_success "Wrote .env"
-
-  if [[ "$generate_compose" == "yes" ]]; then
-    compose_suffix="${DEPLOYMENT_TYPE:-custom}"
-    compose_file="${REPO_ROOT}/docker-compose.${compose_suffix}.yml"
-    if [[ -f "$compose_file" ]]; then
-      if ! confirm_default_yes "Overwrite existing ${compose_file}?"; then
-        compose_file="${REPO_ROOT}/docker-compose.${compose_suffix}.$(date +%Y%m%d_%H%M%S).yml"
-        log_warn "Using new compose file: $compose_file"
-      fi
-    fi
-    generate_docker_compose "$compose_file"
-    log_success "Wrote ${compose_file}"
-    echo "  To start later: docker compose -f ${compose_file} up -d"
-  else
-    log_warn "No docker services selected."
-  fi
-}
-
 env_base_flow() {
   local vllm_embed_api_key=""
   local vllm_rerank_api_key=""
@@ -1744,6 +1612,7 @@ env_base_flow() {
 
   log_step "LLM configuration"
   collect_llm_config
+  echo ""
 
   # ── Embedding ────────────────────────────────────────────────────────────────
   log_step "Embedding configuration"
@@ -1805,6 +1674,7 @@ env_base_flow() {
   else
     collect_embedding_config
   fi
+  echo ""
 
   # ── Reranker ─────────────────────────────────────────────────────────────────
   log_step "Reranker configuration"
@@ -1876,12 +1746,13 @@ env_base_flow() {
         "http://vllm-rerank:${rerank_port}/rerank"
     else
       # Reranking enabled but not via Docker — ask provider/host/model/api_key
-      collect_rerank_config "yes"
+      collect_rerank_config "yes" "no"
     fi
   else
     ENV_VALUES["RERANK_BINDING"]="null"
     unset 'ENV_VALUES[LIGHTRAG_SETUP_RERANK_PROVIDER]'
   fi
+  echo ""
 
   finalize_base_setup
 }
@@ -1892,6 +1763,7 @@ finalize_base_setup() {
   local existing_compose
   local generate_compose="no"
   local runtime_target="$DEFAULT_RUNTIME_TARGET"
+  local show_host_start_hint="no"
   local svc
 
   if [[ ! -f "${REPO_ROOT}/env.example" ]]; then
@@ -1917,19 +1789,8 @@ finalize_base_setup() {
   existing_compose="$(find_generated_compose_file)"
   compose_file="${REPO_ROOT}/docker-compose.final.yml"
 
-  if [[ -z "$existing_compose" ]]; then
-    if ((${#DOCKER_SERVICES[@]} > 0)); then
-      if confirm_default_yes "Generate ${compose_file}?"; then
-        generate_compose="yes"
-      fi
-    else
-      if confirm_default_no "Generate ${compose_file} for LightRAG only?"; then
-        generate_compose="yes"
-      fi
-    fi
-  else
-    generate_compose="yes"
-    # Detect and preserve existing storage services.
+  # Preserve storage services from any existing compose file.
+  if [[ -n "$existing_compose" ]]; then
     while IFS= read -r svc; do
       local is_storage="no"
       for storage_svc in "${STORAGE_SERVICES[@]}"; do
@@ -1944,8 +1805,48 @@ finalize_base_setup() {
     done < <(detect_managed_root_services "$existing_compose")
   fi
 
-  if [[ "$generate_compose" == "yes" ]]; then
+  if ((${#DOCKER_SERVICES[@]} > 0)); then
+    # LightRAG depends on managed Docker services; it must run via Docker.
+    local svc_names
+    svc_names="$(printf '%s ' "${DOCKER_SERVICES[@]}")"
+    svc_names="${svc_names% }"
+    echo "LightRAG requires Docker services: ${svc_names}"
+    if ! confirm_default_yes "The compose file will be created/updated. Continue?"; then
+      log_warn "Setup cancelled."
+      return 1
+    fi
+    generate_compose="yes"
     runtime_target="compose"
+  else
+    # No managed service dependencies — ask whether to run LightRAG via Docker.
+    local current_target="${ENV_VALUES[LIGHTRAG_RUNTIME_TARGET]:-$DEFAULT_RUNTIME_TARGET}"
+    # If an existing compose file is present, default to keeping Docker mode.
+    local effective_default="$current_target"
+    if [[ -n "$existing_compose" ]]; then
+      effective_default="compose"
+    fi
+
+    if [[ "$effective_default" == "compose" ]]; then
+      if ! confirm_default_yes "Run LightRAG Server via Docker?"; then
+        # User opts out: switch to host mode and remove the stale compose file.
+        if [[ -n "$existing_compose" ]]; then
+          rm "$existing_compose"
+          log_success "Removed ${existing_compose}"
+        fi
+        show_host_start_hint="yes"
+      else
+        generate_compose="yes"
+        runtime_target="compose"
+      fi
+    else
+      if confirm_default_no "Run LightRAG Server via Docker?"; then
+        generate_compose="yes"
+        runtime_target="compose"
+      fi
+    fi
+  fi
+
+  if [[ "$generate_compose" == "yes" ]]; then
     if ! prepare_inherited_ssl_assets_for_compose "$existing_compose"; then
       return 1
     fi
@@ -1970,6 +1871,8 @@ finalize_base_setup() {
       log_success "Storage services preserved; vLLM services updated."
     fi
     echo "  To start: docker compose -f ${compose_file} up -d"
+  elif [[ "$show_host_start_hint" == "yes" ]]; then
+    echo "  To start: lightrag-server"
   fi
 }
 
@@ -2130,10 +2033,13 @@ env_server_flow() {
 
   log_step "Server configuration"
   collect_server_config
+  echo ""
   log_step "Security configuration"
   collect_security_config "no" "no"
+  echo ""
   log_step "SSL configuration"
   collect_ssl_config
+  echo ""
 
   finalize_server_setup
 }

@@ -16,7 +16,7 @@ COLOR_GREEN :=
 COLOR_YELLOW :=
 endif
 
-.PHONY: help configure env-base env-storage env-server env-validate env-security-check env-backup
+.PHONY: help configure env env-base env-storage env-server env-validate env-security-check env-backup
 
 help:
 	@printf "$(COLOR_BOLD)Interactive setup targets$(COLOR_RESET)\n"
@@ -25,7 +25,8 @@ help:
 	@printf "  $(COLOR_GREEN)make env-server$(COLOR_RESET)       Configure server, security, and SSL\n"
 	@printf "  $(COLOR_GREEN)make env-validate$(COLOR_RESET)     Validate existing .env\n"
 	@printf "  $(COLOR_GREEN)make env-security-check$(COLOR_RESET) Audit existing .env for security risks\n"
-	@printf "  $(COLOR_GREEN)make env-backup$(COLOR_RESET)       Backup current .env\n\n"
+	@printf "  $(COLOR_GREEN)make env-backup$(COLOR_RESET)       Backup current .env\n"
+	@printf "  $(COLOR_GREEN)make env$(COLOR_RESET)              Short form of make env-base\n\n"
 	@printf "$(COLOR_BOLD)Typical workflow$(COLOR_RESET)\n"
 	@printf "  1. make env-base       # set LLM/embedding/reranker\n"
 	@printf "  2. make env-storage    # set storage backends (optional)\n"
@@ -39,10 +40,7 @@ help:
 	@printf "  Bundled service images are defined in scripts/setup/templates/*.yml.\n"
 	@printf "  Compose file output: docker-compose.final.yml\n"
 
-configure:
-	@$(SETUP_BASH) $(SETUP_SCRIPT) --base $(SETUP_OPTS)
-
-env-base:
+env env-base configure:
 	@$(SETUP_BASH) $(SETUP_SCRIPT) --base $(SETUP_OPTS)
 
 env-storage:

@@ -385,6 +385,10 @@ _strip_wizard_managed_services_and_top_level_volumes() {
   : > "$tmp_file"
 
   while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == "$_WIZARD_MANAGED_SERVICES_MARKER" ]]; then
+      continue
+    fi
+
     # Detect top-level (non-indented) keys.
     if [[ "$line" =~ ^[A-Za-z] ]]; then
       if [[ "$in_services" == "yes" && "$line" != "services:" && "$inserted_marker" != "yes" ]]; then
@@ -439,25 +443,74 @@ _merge_managed_service_blocks() {
   local line
   local inserted="no"
 
-  if [[ ! -s "$service_blocks_file" ]]; then
-    return 0
-  fi
-
   : > "$tmp_file"
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ "$line" == "$_WIZARD_MANAGED_SERVICES_MARKER" ]]; then
-      cat "$service_blocks_file" >> "$tmp_file"
-      inserted="yes"
+      if [[ -s "$service_blocks_file" ]]; then
+        cat "$service_blocks_file" >> "$tmp_file"
+        inserted="yes"
+      fi
       continue
     fi
 
     printf '%s\n' "$line" >> "$tmp_file"
   done < "$compose_file"
 
-  if [[ "$inserted" != "yes" ]]; then
+  if [[ -s "$service_blocks_file" && "$inserted" != "yes" ]]; then
     cat "$service_blocks_file" >> "$tmp_file"
   fi
+
+  mv "$tmp_file" "$compose_file"
+}
+
+_normalize_services_section_spacing() {
+  local compose_file="$1"
+  local tmp_file="${compose_file}.normalize-services"
+  _FILE_OPS_CLEANUP_TMP+=("$tmp_file")
+  local line
+  local in_services="no"
+  local pending_blank="no"
+  local saw_service_content="no"
+
+  : > "$tmp_file"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$in_services" == "yes" ]]; then
+      if [[ "$line" == "$_WIZARD_MANAGED_SERVICES_MARKER" ]]; then
+        continue
+      fi
+
+      if [[ -z "$line" ]]; then
+        pending_blank="yes"
+        continue
+      fi
+
+      if [[ ! "$line" =~ ^[[:space:]] ]]; then
+        pending_blank="no"
+        printf '%s\n' "$line" >> "$tmp_file"
+        in_services="no"
+        continue
+      fi
+
+      if [[ "$pending_blank" == "yes" && "$saw_service_content" == "yes" ]]; then
+        printf '\n' >> "$tmp_file"
+      fi
+
+      printf '%s\n' "$line" >> "$tmp_file"
+      pending_blank="no"
+      saw_service_content="yes"
+      continue
+    fi
+
+    printf '%s\n' "$line" >> "$tmp_file"
+
+    if [[ "$line" == "services:" ]]; then
+      in_services="yes"
+      pending_blank="no"
+      saw_service_content="no"
+    fi
+  done < "$compose_file"
 
   mv "$tmp_file" "$compose_file"
 }
@@ -753,6 +806,11 @@ generate_docker_compose() {
   # mounts no longer needed (e.g. after SSL removal) are not left behind.
   _strip_lightrag_wizard_bind_mounts "$tmp_file"
 
+  if [[ -n "${LIGHTRAG_COMPOSE_SERVER_PORT_MAPPING:-}" ]]; then
+    _strip_lightrag_wizard_ports "$tmp_file"
+    inject_lightrag_port_mapping "$tmp_file" "$LIGHTRAG_COMPOSE_SERVER_PORT_MAPPING"
+  fi
+
   append_lightrag_ssl_mount lightrag_mounts "${COMPOSE_ENV_OVERRIDES[SSL_CERTFILE]:-}" || return 1
   append_lightrag_ssl_mount lightrag_mounts "${COMPOSE_ENV_OVERRIDES[SSL_KEYFILE]:-}" || return 1
   if ((${#lightrag_mounts[@]} > 0)); then
@@ -765,6 +823,8 @@ generate_docker_compose() {
   if ((${#lightrag_env_entries[@]} > 0)); then
     inject_lightrag_environment_overrides "$tmp_file" "${lightrag_env_entries[@]}"
   fi
+
+  inject_lightrag_depends_on "$tmp_file" "${DOCKER_SERVICES[@]}"
 
   : > "$service_blocks_file"
   for service in "${DOCKER_SERVICES[@]}"; do
@@ -827,6 +887,7 @@ generate_docker_compose() {
   done
 
   _merge_managed_service_blocks "$tmp_file" "$service_blocks_file"
+  _normalize_services_section_spacing "$tmp_file"
   _append_referenced_volume_blocks "$tmp_file"
 
   mv "$tmp_file" "$output_file"
@@ -930,14 +991,16 @@ inject_service_environment_overrides() {
         environment_style="mapping"
       fi
 
-      if [[ "$line" =~ ^[[:space:]]{4}[^[:space:]] || "$line" =~ ^[[:space:]]{2}[^[:space:]] || "$line" =~ ^(volumes|networks): ]]; then
+      if [[ "$line" =~ ^[[:space:]]{4}[^[:space:]] || "$line" =~ ^[[:space:]]{2}[^[:space:]] || "$line" =~ ^[^[:space:]] ]]; then
         if [[ "$inserted" == "no" ]]; then
           _write_service_environment_entries "$tmp_file" "$environment_style" "${entries[@]}"
           inserted="yes"
         fi
         in_environment="no"
       fi
-    elif [[ "$in_service" == "yes" && "$line" =~ ^[[:space:]]{2}[^[:space:]] && "$line" != "$service_header" ]]; then
+    elif [[ "$in_service" == "yes" && \
+            ( "$line" =~ ^[[:space:]]{2}[^[:space:]] || "$line" =~ ^[^[:space:]] ) && \
+            "$line" != "$service_header" ]]; then
       if [[ "$inserted" == "no" ]]; then
         printf '    environment:\n' >> "$tmp_file"
         _write_service_environment_entries "$tmp_file" "mapping" "${entries[@]}"
@@ -1058,6 +1121,56 @@ _strip_lightrag_wizard_bind_mounts() {
   mv "$tmp_file" "$compose_file"
 }
 
+_is_wizard_lightrag_port_mapping() {
+  local port_spec="$(_strip_wrapping_quotes "$1")"
+
+  case "$port_spec" in
+    9621|9621/tcp|*:9621|*:9621/tcp)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+_strip_lightrag_wizard_ports() {
+  local compose_file="$1"
+  local tmp_file="${compose_file}.strip-lightrag-ports"
+  _FILE_OPS_CLEANUP_TMP+=("$tmp_file")
+  local line
+  local port_spec=""
+  local in_lightrag="no"
+  local in_ports="no"
+
+  : > "$tmp_file"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$in_lightrag" == "yes" && "$in_ports" == "yes" ]]; then
+      if [[ "$line" =~ ^[[:space:]]{6}-[[:space:]](.+)$ ]]; then
+        port_spec="${BASH_REMATCH[1]}"
+        if _is_wizard_lightrag_port_mapping "$port_spec"; then
+          continue
+        fi
+      elif [[ ! "$line" =~ ^[[:space:]]{6} ]]; then
+        in_ports="no"
+      fi
+    elif [[ "$in_lightrag" == "yes" && "$line" =~ ^[[:space:]]{2}[^[:space:]] && "$line" != "  lightrag:" ]]; then
+      in_lightrag="no"
+    fi
+
+    printf '%s\n' "$line" >> "$tmp_file"
+
+    if [[ "$line" == "  lightrag:" ]]; then
+      in_lightrag="yes"
+      in_ports="no"
+    elif [[ "$in_lightrag" == "yes" && "$line" == "    ports:" ]]; then
+      in_ports="yes"
+    fi
+  done < "$compose_file"
+
+  mv "$tmp_file" "$compose_file"
+}
+
 inject_lightrag_bind_mounts() {
   local compose_file="$1"
   shift
@@ -1119,10 +1232,218 @@ inject_lightrag_bind_mounts() {
   mv "$tmp_file" "$compose_file"
 }
 
+inject_lightrag_port_mapping() {
+  local compose_file="$1"
+  local port_mapping="$2"
+  local tmp_file="${compose_file}.ports"
+  _FILE_OPS_CLEANUP_TMP+=("$tmp_file")
+  local line
+  local in_lightrag="no"
+  local in_ports="no"
+  local inserted="no"
+
+  if [[ -z "$port_mapping" ]]; then
+    return 0
+  fi
+
+  : > "$tmp_file"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$in_lightrag" == "yes" && "$in_ports" == "yes" ]]; then
+      if [[ "$line" =~ ^[[:space:]]{4}[^[:space:]-] || "$line" =~ ^[[:space:]]{2}[^[:space:]] || "$line" =~ ^(volumes|networks): ]]; then
+        if [[ "$inserted" == "no" ]]; then
+          printf '      - "%s"\n' "$port_mapping" >> "$tmp_file"
+          inserted="yes"
+        fi
+        in_ports="no"
+      fi
+    elif [[ "$in_lightrag" == "yes" && "$line" =~ ^[[:space:]]{2}[^[:space:]] && "$line" != "  lightrag:" ]]; then
+      if [[ "$inserted" == "no" ]]; then
+        printf '    ports:\n' >> "$tmp_file"
+        printf '      - "%s"\n' "$port_mapping" >> "$tmp_file"
+        inserted="yes"
+      fi
+      in_lightrag="no"
+    fi
+
+    printf '%s\n' "$line" >> "$tmp_file"
+
+    if [[ "$line" == "  lightrag:" ]]; then
+      in_lightrag="yes"
+      in_ports="no"
+    elif [[ "$in_lightrag" == "yes" && "$line" == "    ports:" ]]; then
+      in_ports="yes"
+    fi
+  done < "$compose_file"
+
+  if [[ "$in_lightrag" == "yes" && "$inserted" == "no" ]]; then
+    if [[ "$in_ports" != "yes" ]]; then
+      printf '    ports:\n' >> "$tmp_file"
+    fi
+    printf '      - "%s"\n' "$port_mapping" >> "$tmp_file"
+  fi
+
+  mv "$tmp_file" "$compose_file"
+}
+
 inject_lightrag_environment_overrides() {
   local compose_file="$1"
   shift
   inject_service_environment_overrides "$compose_file" "lightrag" "$@"
+}
+
+inject_lightrag_depends_on() {
+  local compose_file="$1"
+  shift
+  local candidate_service
+  local managed_services=()
+  local tmp_file="${compose_file}.depends-on"
+  _FILE_OPS_CLEANUP_TMP+=("$tmp_file")
+  local line
+  local in_lightrag="no"
+  local in_depends_on="no"
+  local inserted="no"
+  local current_dep_name=""
+  local current_dep_block=""
+  local dep_name=""
+  local dep_tail=""
+  local dep_service=""
+  declare -A preserved_dep_blocks=()
+  declare -A preserved_dep_seen=()
+  local -a preserved_dep_order=()
+
+  for candidate_service in "$@"; do
+    if _is_wizard_managed_root_service_name "$candidate_service"; then
+      managed_services+=("$candidate_service")
+    fi
+  done
+
+  _record_preserved_depends_on_entry() {
+    local service_name="$1"
+    local block="$2"
+
+    if [[ -z "$service_name" ]] || _is_wizard_managed_root_service_name "$service_name"; then
+      return 0
+    fi
+
+    if [[ -n "${preserved_dep_seen[$service_name]+set}" ]]; then
+      return 0
+    fi
+
+    preserved_dep_seen["$service_name"]=1
+    preserved_dep_order+=("$service_name")
+    preserved_dep_blocks["$service_name"]="$block"
+  }
+
+  _flush_current_depends_on_entry() {
+    if [[ -z "$current_dep_name" ]]; then
+      return 0
+    fi
+
+    _record_preserved_depends_on_entry "$current_dep_name" "$current_dep_block"
+    current_dep_name=""
+    current_dep_block=""
+  }
+
+  _write_lightrag_depends_on_block() {
+    local managed_service
+    local preserved_service
+
+    if ((${#preserved_dep_order[@]} == 0 && ${#managed_services[@]} == 0)); then
+      inserted="yes"
+      return 0
+    fi
+
+    printf '    depends_on:\n' >> "$tmp_file"
+
+    for preserved_service in "${preserved_dep_order[@]}"; do
+      printf '%s' "${preserved_dep_blocks[$preserved_service]}" >> "$tmp_file"
+    done
+
+    for managed_service in "${managed_services[@]}"; do
+      printf '      %s:\n' "$managed_service" >> "$tmp_file"
+      printf '        condition: service_healthy\n' >> "$tmp_file"
+    done
+
+    inserted="yes"
+  }
+
+  : > "$tmp_file"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$in_depends_on" == "yes" ]]; then
+      if [[ -n "$current_dep_name" && "$line" =~ ^[[:space:]]{8} ]]; then
+        current_dep_block+="${line}"$'\n'
+        continue
+      fi
+
+      if [[ "$line" =~ ^[[:space:]]{6}-[[:space:]](.+)$ ]]; then
+        _flush_current_depends_on_entry
+        dep_service="$(_strip_wrapping_quotes "${BASH_REMATCH[1]}")"
+        _record_preserved_depends_on_entry \
+          "$dep_service" \
+          "$(printf '      %s:\n        condition: service_started\n' "$dep_service")"
+        continue
+      fi
+
+      if [[ "$line" =~ ^[[:space:]]{6}([A-Za-z0-9_.-]+):[[:space:]]*(.*)$ ]]; then
+        _flush_current_depends_on_entry
+        dep_name="${BASH_REMATCH[1]}"
+        dep_tail="${BASH_REMATCH[2]}"
+        current_dep_name="$(_strip_wrapping_quotes "$dep_name")"
+        if [[ -n "$dep_tail" ]]; then
+          current_dep_block="      ${current_dep_name}: ${dep_tail}"$'\n'
+        else
+          current_dep_block="      ${current_dep_name}:"$'\n'
+        fi
+        continue
+      fi
+
+      _flush_current_depends_on_entry
+      if [[ "$inserted" == "no" ]]; then
+        _write_lightrag_depends_on_block
+      fi
+      in_depends_on="no"
+    fi
+
+    if [[ "$in_lightrag" == "yes" && "$line" == "    depends_on:" ]]; then
+      in_depends_on="yes"
+      continue
+    fi
+
+    if [[ "$in_lightrag" == "yes" && \
+          ( "$line" =~ ^[[:space:]]{2}[^[:space:]] || "$line" =~ ^[^[:space:]] ) && \
+          "$line" != "  lightrag:" ]]; then
+      if [[ "$inserted" == "no" ]]; then
+        _write_lightrag_depends_on_block
+      fi
+      in_lightrag="no"
+    fi
+
+    printf '%s\n' "$line" >> "$tmp_file"
+
+    if [[ "$line" == "  lightrag:" ]]; then
+      in_lightrag="yes"
+      inserted="no"
+      in_depends_on="no"
+      current_dep_name=""
+      current_dep_block=""
+      preserved_dep_blocks=()
+      preserved_dep_seen=()
+      preserved_dep_order=()
+    fi
+  done < "$compose_file"
+
+  if [[ "$in_depends_on" == "yes" ]]; then
+    _flush_current_depends_on_entry
+    if [[ "$inserted" == "no" ]]; then
+      _write_lightrag_depends_on_block
+    fi
+  elif [[ "$in_lightrag" == "yes" && "$inserted" == "no" ]]; then
+    _write_lightrag_depends_on_block
+  fi
+
+  mv "$tmp_file" "$compose_file"
 }
 
 # Find the first generated compose file in priority order.
