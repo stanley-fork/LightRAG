@@ -245,6 +245,7 @@ _WIZARD_COMPOSE_LIGHTRAG_KEYS=(
   "EMBEDDING_BINDING_HOST" "RERANK_BINDING_HOST" "LLM_BINDING_HOST"
   "REDIS_URI" "MONGO_URI" "NEO4J_URI" "MILVUS_URI" "QDRANT_URL" "MEMGRAPH_URI"
   "POSTGRES_HOST" "POSTGRES_PORT" "PORT" "HOST" "SSL_CERTFILE" "SSL_KEYFILE"
+  "WORKING_DIR" "INPUT_DIR"
 )
 
 _managed_service_root_name() {
@@ -642,6 +643,9 @@ _normalize_services_section_spacing() {
 
       if [[ ! "$line" =~ ^[[:space:]] ]]; then
         pending_blank="no"
+        if [[ "$saw_service_content" == "yes" ]]; then
+          printf '\n' >> "$tmp_file"
+        fi
         printf '%s\n' "$line" >> "$tmp_file"
         in_services="no"
         continue
@@ -892,6 +896,27 @@ _collect_referenced_named_volumes() {
   done < "$compose_file"
 }
 
+_trim_trailing_blank_lines_in_file() {
+  local file="$1"
+  local trim_file="${file}.trim-tail"
+  _FILE_OPS_CLEANUP_TMP+=("$trim_file")
+
+  awk '
+    { lines[NR] = $0 }
+    END {
+      last = NR
+      while (last > 0 && lines[last] == "") {
+        last--
+      }
+      for (i = 1; i <= last; i++) {
+        print lines[i]
+      }
+    }
+  ' "$file" > "$trim_file"
+
+  mv "$trim_file" "$file"
+}
+
 _append_referenced_volume_blocks() {
   local compose_file="$1"
   local -a referenced_volumes=()
@@ -908,6 +933,7 @@ _append_referenced_volume_blocks() {
     return 0
   fi
 
+  _trim_trailing_blank_lines_in_file "$compose_file"
   printf '\nvolumes:\n' >> "$compose_file"
   for volume_name in "${referenced_volumes[@]}"; do
     if _is_wizard_managed_volume_name "$volume_name"; then
@@ -963,6 +989,7 @@ generate_docker_compose() {
   fi
 
   prepare_lightrag_service_for_generated_compose "$tmp_file"
+  normalize_lightrag_restart_policy "$tmp_file"
   # Remove stale wizard-managed keys from lightrag's environment so that
   # keys no longer in COMPOSE_ENV_OVERRIDES are not left behind.
   _strip_lightrag_wizard_environment_keys "$tmp_file"
@@ -1113,6 +1140,149 @@ prepare_lightrag_service_for_generated_compose() {
       in_env_file="no"
     fi
   done < "$compose_file"
+
+  mv "$tmp_file" "$compose_file"
+}
+
+normalize_lightrag_restart_policy() {
+  local compose_file="$1"
+  local tmp_file="${compose_file}.normalize-lightrag-restart"
+  _FILE_OPS_CLEANUP_TMP+=("$tmp_file")
+  local line
+  local in_lightrag="no"
+  local in_deploy="no"
+  local deploy_seen="no"
+  local insert_blank_after_deploy="no"
+  local skip_blank_after_removed_restart="no"
+  local -a deploy_lines=()
+
+  _trim_trailing_blank_lines() {
+    local file="$1"
+    local trim_file="${file}.trim"
+    _FILE_OPS_CLEANUP_TMP+=("$trim_file")
+
+    awk '
+      { lines[NR] = $0 }
+      END {
+        last = NR
+        while (last > 0 && lines[last] == "") {
+          last--
+        }
+        for (i = 1; i <= last; i++) {
+          print lines[i]
+        }
+      }
+    ' "$file" > "$trim_file"
+
+    mv "$trim_file" "$file"
+  }
+
+  _write_normalized_lightrag_deploy_block() {
+    local deploy_line
+    local skipping_restart_policy="no"
+
+    printf '    deploy:\n' >> "$tmp_file"
+    for deploy_line in "${deploy_lines[@]}"; do
+      if [[ -z "$deploy_line" ]]; then
+        continue
+      fi
+
+      if [[ "$skipping_restart_policy" == "yes" ]]; then
+        if [[ "$deploy_line" =~ ^[[:space:]]{8} ]]; then
+          continue
+        fi
+        skipping_restart_policy="no"
+      fi
+
+      if [[ "$deploy_line" == "      restart_policy:" ]]; then
+        skipping_restart_policy="yes"
+        continue
+      fi
+
+      printf '%s\n' "$deploy_line" >> "$tmp_file"
+    done
+
+    printf '      restart_policy:\n' >> "$tmp_file"
+    printf '        condition: on-failure\n' >> "$tmp_file"
+    printf '        max_attempts: 10\n' >> "$tmp_file"
+  }
+
+  : > "$tmp_file"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$in_deploy" == "yes" ]]; then
+      if [[ "$line" =~ ^[[:space:]]{6} || -z "$line" ]]; then
+        deploy_lines+=("$line")
+        continue
+      fi
+
+      _trim_trailing_blank_lines "$tmp_file"
+      _write_normalized_lightrag_deploy_block
+      deploy_lines=()
+      in_deploy="no"
+      if [[ "$line" =~ ^[[:space:]]{2}[^[:space:]] || "$line" =~ ^[^[:space:]] ]]; then
+        insert_blank_after_deploy="yes"
+      fi
+    fi
+
+    if [[ "$in_lightrag" == "yes" && "$line" =~ ^[[:space:]]{2}[^[:space:]] && "$line" != "  lightrag:" ]] || \
+      [[ "$in_lightrag" == "yes" && "$line" =~ ^[^[:space:]] ]]; then
+      if [[ "$deploy_seen" != "yes" ]]; then
+        _trim_trailing_blank_lines "$tmp_file"
+        _write_normalized_lightrag_deploy_block
+        insert_blank_after_deploy="yes"
+      fi
+      in_lightrag="no"
+      deploy_seen="no"
+      skip_blank_after_removed_restart="no"
+    fi
+
+    if [[ "$in_lightrag" == "yes" && "$line" == "    deploy:" ]]; then
+      in_deploy="yes"
+      deploy_seen="yes"
+      deploy_lines=()
+      continue
+    fi
+
+    if [[ "$in_lightrag" == "yes" && "$line" =~ ^[[:space:]]{4}restart: ]]; then
+      skip_blank_after_removed_restart="yes"
+      continue
+    fi
+
+    if [[ "$skip_blank_after_removed_restart" == "yes" && "$in_lightrag" == "yes" ]]; then
+      if [[ -z "$line" ]]; then
+        continue
+      fi
+      skip_blank_after_removed_restart="no"
+    fi
+
+    if [[ "$insert_blank_after_deploy" == "yes" ]]; then
+      printf '\n' >> "$tmp_file"
+      insert_blank_after_deploy="no"
+    fi
+
+    printf '%s\n' "$line" >> "$tmp_file"
+
+    if [[ "$line" == "  lightrag:" ]]; then
+      in_lightrag="yes"
+      in_deploy="no"
+      deploy_seen="no"
+      insert_blank_after_deploy="no"
+      skip_blank_after_removed_restart="no"
+      deploy_lines=()
+    fi
+  done < "$compose_file"
+
+  if [[ "$in_deploy" == "yes" ]]; then
+    _trim_trailing_blank_lines "$tmp_file"
+    _write_normalized_lightrag_deploy_block
+    deploy_seen="yes"
+  fi
+
+  if [[ "$in_lightrag" == "yes" && "$deploy_seen" != "yes" ]]; then
+    _trim_trailing_blank_lines "$tmp_file"
+    _write_normalized_lightrag_deploy_block
+  fi
 
   mv "$tmp_file" "$compose_file"
 }
@@ -1320,6 +1490,11 @@ _strip_lightrag_wizard_bind_mounts() {
 
 _is_wizard_lightrag_port_mapping() {
   local port_spec="$(_strip_wrapping_quotes "$1")"
+
+  if [[ "$port_spec" == '${HOST:-0.0.0.0}:${PORT:-9621}:9621' || \
+        "$port_spec" == '${PORT:-9621}:9621' ]]; then
+    return 0
+  fi
 
   case "$port_spec" in
     9621|9621/tcp|*:9621|*:9621/tcp)
@@ -1626,6 +1801,7 @@ inject_lightrag_depends_on() {
   local in_lightrag="no"
   local in_depends_on="no"
   local inserted="no"
+  local insert_blank_after_depends_on="no"
   local current_dep_name=""
   local current_dep_block=""
   local dep_name=""
@@ -1666,6 +1842,27 @@ inject_lightrag_depends_on() {
     _record_preserved_depends_on_entry "$current_dep_name" "$current_dep_block"
     current_dep_name=""
     current_dep_block=""
+  }
+
+  _trim_trailing_blank_lines() {
+    local file="$1"
+    local trim_file="${file}.trim"
+    _FILE_OPS_CLEANUP_TMP+=("$trim_file")
+
+    awk '
+      { lines[NR] = $0 }
+      END {
+        last = NR
+        while (last > 0 && lines[last] == "") {
+          last--
+        }
+        for (i = 1; i <= last; i++) {
+          print lines[i]
+        }
+      }
+    ' "$file" > "$trim_file"
+
+    mv "$trim_file" "$file"
   }
 
   _write_lightrag_depends_on_block() {
@@ -1724,6 +1921,7 @@ inject_lightrag_depends_on() {
 
       _flush_current_depends_on_entry
       if [[ "$inserted" == "no" ]]; then
+        _trim_trailing_blank_lines "$tmp_file"
         _write_lightrag_depends_on_block
       fi
       in_depends_on="no"
@@ -1738,9 +1936,16 @@ inject_lightrag_depends_on() {
           ( "$line" =~ ^[[:space:]]{2}[^[:space:]] || "$line" =~ ^[^[:space:]] ) && \
           "$line" != "  lightrag:" ]]; then
       if [[ "$inserted" == "no" ]]; then
+        _trim_trailing_blank_lines "$tmp_file"
         _write_lightrag_depends_on_block
+        insert_blank_after_depends_on="yes"
       fi
       in_lightrag="no"
+    fi
+
+    if [[ "$insert_blank_after_depends_on" == "yes" ]]; then
+      printf '\n' >> "$tmp_file"
+      insert_blank_after_depends_on="no"
     fi
 
     printf '%s\n' "$line" >> "$tmp_file"
@@ -1748,6 +1953,7 @@ inject_lightrag_depends_on() {
     if [[ "$line" == "  lightrag:" ]]; then
       in_lightrag="yes"
       inserted="no"
+      insert_blank_after_depends_on="no"
       in_depends_on="no"
       current_dep_name=""
       current_dep_block=""
@@ -1760,9 +1966,11 @@ inject_lightrag_depends_on() {
   if [[ "$in_depends_on" == "yes" ]]; then
     _flush_current_depends_on_entry
     if [[ "$inserted" == "no" ]]; then
+      _trim_trailing_blank_lines "$tmp_file"
       _write_lightrag_depends_on_block
     fi
   elif [[ "$in_lightrag" == "yes" && "$inserted" == "no" ]]; then
+    _trim_trailing_blank_lines "$tmp_file"
     _write_lightrag_depends_on_block
   fi
 
