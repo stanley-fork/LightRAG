@@ -327,7 +327,7 @@ class TestKVStorage:
             assert result == {"b"}
 
     @pytest.mark.asyncio
-    async def test_upsert_uses_wait_for_refresh(
+    async def test_upsert_no_per_operation_refresh(
         self, global_config, embed_func, mock_client
     ):
         with patch.object(ClientManager, "get_client", return_value=mock_client):
@@ -339,7 +339,7 @@ class TestKVStorage:
                 await s.initialize()
                 await s.upsert({"k1": {"content": "v1"}})
                 _, kwargs = mock_bulk.call_args
-                assert kwargs["refresh"] == "wait_for"
+                assert "refresh" not in kwargs
 
     @pytest.mark.asyncio
     async def test_upsert_sets_timestamps(self, global_config, embed_func, mock_client):
@@ -456,6 +456,67 @@ class TestKVStorage:
             assert await s.get_by_id("doc1") is None
             assert s._index_ready is False
             assert mock_client.mget.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_iter_raw_docs_uses_pit_and_search_after(
+        self, global_config, embed_func, mock_client
+    ):
+        mock_client.search = AsyncMock(
+            side_effect=[
+                {
+                    "hits": {
+                        "hits": [
+                            {"_id": "d1", "_source": {"content": "a"}, "sort": [1]},
+                            {"_id": "d2", "_source": {"content": "b"}, "sort": [2]},
+                        ]
+                    }
+                },
+                {
+                    "hits": {
+                        "hits": [
+                            {"_id": "d3", "_source": {"content": "c"}, "sort": [3]}
+                        ]
+                    }
+                },
+            ]
+        )
+
+        with patch.object(ClientManager, "get_client", return_value=mock_client):
+            s = self._make(global_config, embed_func)
+            await s.initialize()
+
+            batches = [batch async for batch in s._iter_raw_docs(batch_size=2)]
+
+            assert [[doc["_id"] for doc in batch] for batch in batches] == [
+                ["d1", "d2"],
+                ["d3"],
+            ]
+            assert (
+                "search_after"
+                not in mock_client.search.await_args_list[0].kwargs["body"]
+            )
+            assert mock_client.search.await_args_list[1].kwargs["body"][
+                "search_after"
+            ] == [2]
+            mock_client.create_pit.assert_awaited_once()
+            mock_client.delete_pit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_iter_raw_docs_missing_index_demotes_readiness(
+        self, global_config, embed_func, mock_client
+    ):
+        mock_client.search = AsyncMock(side_effect=_missing_index_error())
+
+        with patch.object(ClientManager, "get_client", return_value=mock_client):
+            s = self._make(global_config, embed_func)
+            await s.initialize()
+
+            batches = [batch async for batch in s._iter_raw_docs(batch_size=2)]
+
+            assert batches == []
+            assert s._index_ready is False
+            mock_client.create_pit.assert_awaited_once()
+            mock_client.delete_pit.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_finalize(self, global_config, embed_func, mock_client):
