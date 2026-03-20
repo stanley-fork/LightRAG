@@ -1185,6 +1185,7 @@ collect_neo4j_config() {
   local default_docker="${1:-no}"
   local use_docker="no"
   local uri username password database
+  local existing_username="" existing_password="" existing_database=""
 
   if [[ "$default_docker" == "yes" ]]; then
     if confirm_default_yes "Run Neo4j locally via Docker?"; then
@@ -1207,18 +1208,21 @@ collect_neo4j_config() {
   if [[ "$use_docker" == "yes" ]]; then
     uri="$(normalize_neo4j_uri_for_local_service "$uri")"
   fi
+  existing_username="${ORIGINAL_ENV_VALUES[NEO4J_USERNAME]-${ENV_VALUES[NEO4J_USERNAME]:-}}"
+  existing_password="${ORIGINAL_ENV_VALUES[NEO4J_PASSWORD]-${ENV_VALUES[NEO4J_PASSWORD]:-}}"
+  existing_database="${ORIGINAL_ENV_VALUES[NEO4J_DATABASE]-${ENV_VALUES[NEO4J_DATABASE]:-}}"
   if [[ "$use_docker" == "yes" ]]; then
-    username="$(prompt_until_valid "Neo4j username" "${ENV_VALUES[NEO4J_USERNAME]:-neo4j}" validate_non_empty)"
-    password="$(prompt_secret_until_valid_with_default "Neo4j password: " "${ENV_VALUES[NEO4J_PASSWORD]:-neo4j_password}" validate_non_empty)"
-    if [[ -n "${ENV_VALUES[NEO4J_DATABASE]:-}" ]]; then
-      database="$(prompt_with_default "Neo4j database" "${ENV_VALUES[NEO4J_DATABASE]}")"
+    username="$(prompt_until_valid "Neo4j username" "${existing_username:-neo4j}" validate_non_empty)"
+    password="$(prompt_secret_until_valid_with_default "Neo4j password: " "${existing_password:-neo4j_password}" validate_non_empty)"
+    if [[ -n "$existing_database" ]]; then
+      database="$(prompt_with_default "Neo4j database" "$existing_database")"
     else
       database="neo4j"
     fi
   else
-    username="$(prompt_with_default "Neo4j username" "${ENV_VALUES[NEO4J_USERNAME]:-neo4j}")"
-    password="$(prompt_secret_with_default "Neo4j password: " "${ENV_VALUES[NEO4J_PASSWORD]:-neo4j_password}")"
-    database="$(prompt_with_default "Neo4j database" "${ENV_VALUES[NEO4J_DATABASE]:-neo4j}")"
+    username="$(prompt_with_default "Neo4j username" "${existing_username:-neo4j}")"
+    password="$(prompt_secret_with_default "Neo4j password: " "${existing_password:-neo4j_password}")"
+    database="$(prompt_with_default "Neo4j database" "${existing_database:-neo4j}")"
   fi
 
   ENV_VALUES["NEO4J_URI"]="$uri"
@@ -1236,6 +1240,7 @@ collect_mongodb_config() {
   local default_docker="${1:-no}"
   local use_docker="no"
   local uri database
+  local existing_database=""
   local vector_search_required="no"
 
   if [[ "${ENV_VALUES[LIGHTRAG_VECTOR_STORAGE]:-}" == "MongoVectorDBStorage" ]]; then
@@ -1274,7 +1279,8 @@ collect_mongodb_config() {
   if [[ "$use_docker" == "yes" ]]; then
     uri="$(normalize_mongodb_uri_for_local_service "$uri")"
   fi
-  database="$(prompt_with_default "MongoDB database" "${ENV_VALUES[MONGO_DATABASE]:-LightRAG}")"
+  existing_database="${ORIGINAL_ENV_VALUES[MONGO_DATABASE]-${ENV_VALUES[MONGO_DATABASE]:-}}"
+  database="$(prompt_with_default "MongoDB database" "${existing_database:-LightRAG}")"
 
   ENV_VALUES["MONGO_URI"]="$uri"
   ENV_VALUES["MONGO_DATABASE"]="$database"
@@ -1323,6 +1329,7 @@ collect_milvus_config() {
   local default_docker="${1:-no}"
   local use_docker="no"
   local uri db_name milvus_device=""
+  local existing_db_name="" existing_device=""
 
   if [[ "$default_docker" == "yes" ]]; then
     if confirm_default_yes "Run Milvus locally via Docker?"; then
@@ -1342,8 +1349,10 @@ collect_milvus_config() {
   fi
 
   uri="$(prompt_until_valid "Milvus URI" "$uri" validate_uri milvus)"
+  existing_db_name="${ORIGINAL_ENV_VALUES[MILVUS_DB_NAME]-${ENV_VALUES[MILVUS_DB_NAME]:-}}"
+  existing_device="${ORIGINAL_ENV_VALUES[MILVUS_DEVICE]-${ENV_VALUES[MILVUS_DEVICE]:-}}"
   if [[ "$use_docker" == "yes" ]]; then
-    milvus_device="$(resolve_local_device_default "${ENV_VALUES[MILVUS_DEVICE]:-}")"
+    milvus_device="$(resolve_local_device_default "$existing_device")"
     milvus_device="$(prompt_choice "Milvus device" "$milvus_device" "cpu" "cuda")"
     if [[ "$milvus_device" == "cuda" ]] && ! host_cuda_available; then
       log_warn "CUDA device selected for Milvus but no NVIDIA driver detected on host."
@@ -1356,7 +1365,7 @@ collect_milvus_config() {
       ENV_VALUES["MINIO_SECRET_ACCESS_KEY"]="minioadmin"
     fi
   fi
-  db_name="$(prompt_with_default "Milvus database name" "${ENV_VALUES[MILVUS_DB_NAME]:-lightrag}")"
+  db_name="$(prompt_with_default "Milvus database name" "${existing_db_name:-lightrag}")"
 
   ENV_VALUES["MILVUS_URI"]="$uri"
   ENV_VALUES["MILVUS_DB_NAME"]="$db_name"
@@ -1374,6 +1383,7 @@ collect_qdrant_config() {
   local default_docker="${1:-no}"
   local use_docker="no"
   local url qdrant_device=""
+  local existing_device=""
 
   if [[ "$default_docker" == "yes" ]]; then
     if confirm_default_yes "Run Qdrant locally via Docker?"; then
@@ -1393,8 +1403,9 @@ collect_qdrant_config() {
   fi
 
   url="$(prompt_until_valid "Qdrant URL" "$url" validate_uri qdrant)"
+  existing_device="${ORIGINAL_ENV_VALUES[QDRANT_DEVICE]-${ENV_VALUES[QDRANT_DEVICE]:-}}"
   if [[ "$use_docker" == "yes" ]]; then
-    qdrant_device="$(resolve_local_device_default "${ENV_VALUES[QDRANT_DEVICE]:-}")"
+    qdrant_device="$(resolve_local_device_default "$existing_device")"
     qdrant_device="$(prompt_choice "Qdrant device" "$qdrant_device" "cpu" "cuda")"
     if [[ "$qdrant_device" == "cuda" ]] && ! host_cuda_available; then
       log_warn "CUDA device selected for Qdrant but no NVIDIA driver detected on host."
@@ -1450,6 +1461,8 @@ collect_opensearch_config() {
   local default_docker="${1:-no}"
   local use_docker="no"
   local hosts user password
+  local existing_user="" existing_password=""
+  local existing_use_ssl="" existing_verify_certs=""
   local use_ssl="true"
   local verify_certs="false"
   local use_ssl_default="yes"
@@ -1472,19 +1485,24 @@ collect_opensearch_config() {
     hosts="${ENV_VALUES[OPENSEARCH_HOSTS]:-localhost:9200}"
   fi
 
+  existing_user="${ORIGINAL_ENV_VALUES[OPENSEARCH_USER]-${ENV_VALUES[OPENSEARCH_USER]:-}}"
+  existing_password="${ORIGINAL_ENV_VALUES[OPENSEARCH_PASSWORD]-${ENV_VALUES[OPENSEARCH_PASSWORD]:-}}"
+  existing_use_ssl="${ORIGINAL_ENV_VALUES[OPENSEARCH_USE_SSL]-${ENV_VALUES[OPENSEARCH_USE_SSL]:-}}"
+  existing_verify_certs="${ORIGINAL_ENV_VALUES[OPENSEARCH_VERIFY_CERTS]-${ENV_VALUES[OPENSEARCH_VERIFY_CERTS]:-}}"
+
   hosts="$(prompt_until_valid "OpenSearch hosts (host:port, comma-separated)" "$hosts" validate_opensearch_hosts_format)"
-  user="$(prompt_with_default "OpenSearch user" "${ENV_VALUES[OPENSEARCH_USER]:-admin}")"
-  password="$(prompt_secret_until_valid_with_default "OpenSearch password: " "${ENV_VALUES[OPENSEARCH_PASSWORD]:-LightRAG2026_!@}" validate_opensearch_password_strength)"
+  user="$(prompt_with_default "OpenSearch user" "${existing_user:-admin}")"
+  password="$(prompt_secret_until_valid_with_default "OpenSearch password: " "${existing_password:-LightRAG2026_!@}" validate_opensearch_password_strength)"
 
   if [[ "$use_docker" == "yes" ]]; then
-    if [[ -n "${ENV_VALUES[OPENSEARCH_USE_SSL]:-}" ]]; then
-      env_value_is_true "${ENV_VALUES[OPENSEARCH_USE_SSL]}" && use_ssl="true" || use_ssl="false"
+    if [[ -n "$existing_use_ssl" ]]; then
+      env_value_is_true "$existing_use_ssl" && use_ssl="true" || use_ssl="false"
     else
       use_ssl="true"
     fi
     verify_certs="false"
   else
-    if [[ -n "${ENV_VALUES[OPENSEARCH_USE_SSL]:-}" ]] && ! env_value_is_true "${ENV_VALUES[OPENSEARCH_USE_SSL]}"; then
+    if [[ -n "$existing_use_ssl" ]] && ! env_value_is_true "$existing_use_ssl"; then
       use_ssl_default="no"
     fi
 
@@ -1495,7 +1513,7 @@ collect_opensearch_config() {
     fi
 
     if [[ "$use_ssl" == "true" ]]; then
-      if [[ -n "${ENV_VALUES[OPENSEARCH_VERIFY_CERTS]:-}" ]] && env_value_is_true "${ENV_VALUES[OPENSEARCH_VERIFY_CERTS]}"; then
+      if [[ -n "$existing_verify_certs" ]] && env_value_is_true "$existing_verify_certs"; then
         verify_certs_default="yes"
       fi
 
