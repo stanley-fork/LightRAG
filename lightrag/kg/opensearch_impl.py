@@ -975,6 +975,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
     _nodes_index: str = field(default="", init=False)
     _edges_index: str = field(default="", init=False)
     _indices_ready: bool = field(default=False, init=False)
+    _nodes_dirty: bool = field(default=False, init=False)
+    _edges_dirty: bool = field(default=False, init=False)
     _ppl_graphlookup_available: bool = field(default=False, init=False)
 
     def __init__(self, namespace, global_config, embedding_func, workspace=None):
@@ -1000,6 +1002,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 self.client = await ClientManager.get_client()
             await self._create_indices_if_not_exist()
             self._indices_ready = True
+            self._nodes_dirty = False
+            self._edges_dirty = False
             await self._detect_ppl_graphlookup()
             logger.debug(
                 f"[{self.workspace}] OpenSearch Graph storage initialized: "
@@ -1021,6 +1025,34 @@ class OpenSearchGraphStorage(BaseGraphStorage):
     def _mark_indices_missing(self):
         """Mark graph indices as unavailable for subsequent read short-circuiting."""
         self._indices_ready = False
+        self._nodes_dirty = False
+        self._edges_dirty = False
+
+    async def _refresh_graph_indices_if_dirty(
+        self, *, refresh_nodes: bool = False, refresh_edges: bool = False
+    ) -> None:
+        """Refresh graph indices only when prior writes made search views stale."""
+        if not self._indices_ready:
+            return
+        if not (
+            (refresh_nodes and self._nodes_dirty)
+            or (refresh_edges and self._edges_dirty)
+        ):
+            return
+
+        try:
+            async with get_data_init_lock():
+                if refresh_nodes and self._nodes_dirty:
+                    await self.client.indices.refresh(index=self._nodes_index)
+                    self._nodes_dirty = False
+                if refresh_edges and self._edges_dirty:
+                    await self.client.indices.refresh(index=self._edges_index)
+                    self._edges_dirty = False
+        except OpenSearchException as e:
+            if _is_missing_index_error(e):
+                self._mark_indices_missing()
+                return
+            raise
 
     async def _detect_ppl_graphlookup(self):
         """Detect whether PPL graphlookup command is available on this cluster."""
@@ -1145,37 +1177,25 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             return False
 
     async def has_edge(self, source_node_id: str, target_node_id: str) -> bool:
-        """Check whether an edge exists between two nodes (bidirectional)."""
+        """Check whether an edge exists between two nodes (bidirectional).
+
+        Uses mget with the two candidate edge IDs so the check is real-time
+        (translog-backed), consistent with has_node() and independent of the
+        index refresh cycle.
+        """
         if not self._indices_ready:
             return False
         try:
-            body = {
-                "query": {
-                    "bool": {
-                        "should": [
-                            {
-                                "bool": {
-                                    "must": [
-                                        {"term": {"source_node_id": source_node_id}},
-                                        {"term": {"target_node_id": target_node_id}},
-                                    ]
-                                }
-                            },
-                            {
-                                "bool": {
-                                    "must": [
-                                        {"term": {"source_node_id": target_node_id}},
-                                        {"term": {"target_node_id": source_node_id}},
-                                    ]
-                                }
-                            },
-                        ]
-                    }
-                },
-                "size": 0,
-            }
-            response = await self.client.search(index=self._edges_index, body=body)
-            return response["hits"]["total"]["value"] > 0
+            forward_id = compute_mdhash_id(
+                f"{source_node_id}-{target_node_id}", prefix="edge-"
+            )
+            reverse_id = compute_mdhash_id(
+                f"{target_node_id}-{source_node_id}", prefix="edge-"
+            )
+            response = await self.client.mget(
+                index=self._edges_index, body={"ids": [forward_id, reverse_id]}
+            )
+            return any(doc.get("found") for doc in response.get("docs", []))
         except OpenSearchException as e:
             if _is_missing_index_error(e):
                 self._mark_indices_missing()
@@ -1186,6 +1206,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         if not self._indices_ready:
             return 0
         try:
+            await self._refresh_graph_indices_if_dirty(refresh_edges=True)
             response = await self.client.count(
                 index=self._edges_index,
                 body={
@@ -1230,41 +1251,29 @@ class OpenSearchGraphStorage(BaseGraphStorage):
     async def get_edge(
         self, source_node_id: str, target_node_id: str
     ) -> dict[str, str] | None:
-        """Get an edge between two nodes (bidirectional), or None."""
+        """Get an edge between two nodes (bidirectional), or None.
+
+        Uses mget with the two candidate edge IDs so the read is real-time
+        (translog-backed), consistent with get_node() and independent of the
+        index refresh cycle.
+        """
         if not self._indices_ready:
             return None
         try:
-            body = {
-                "query": {
-                    "bool": {
-                        "should": [
-                            {
-                                "bool": {
-                                    "must": [
-                                        {"term": {"source_node_id": source_node_id}},
-                                        {"term": {"target_node_id": target_node_id}},
-                                    ]
-                                }
-                            },
-                            {
-                                "bool": {
-                                    "must": [
-                                        {"term": {"source_node_id": target_node_id}},
-                                        {"term": {"target_node_id": source_node_id}},
-                                    ]
-                                }
-                            },
-                        ]
-                    }
-                },
-                "size": 1,
-            }
-            response = await self.client.search(index=self._edges_index, body=body)
-            hits = response["hits"]["hits"]
-            if hits:
-                doc = hits[0]["_source"]
-                doc["_id"] = hits[0]["_id"]
-                return doc
+            forward_id = compute_mdhash_id(
+                f"{source_node_id}-{target_node_id}", prefix="edge-"
+            )
+            reverse_id = compute_mdhash_id(
+                f"{target_node_id}-{source_node_id}", prefix="edge-"
+            )
+            response = await self.client.mget(
+                index=self._edges_index, body={"ids": [forward_id, reverse_id]}
+            )
+            for doc in response.get("docs", []):
+                if doc.get("found"):
+                    result = doc["_source"]
+                    result["_id"] = doc["_id"]
+                    return result
             return None
         except OpenSearchException as e:
             if _is_missing_index_error(e):
@@ -1276,6 +1285,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         if not self._indices_ready:
             return None
         try:
+            await self._refresh_graph_indices_if_dirty(refresh_edges=True)
             query = {
                 "bool": {
                     "should": [
@@ -1355,6 +1365,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         if not self._indices_ready:
             return {}
         try:
+            await self._refresh_graph_indices_if_dirty(refresh_edges=True)
             # Use a single query with aggregations for both source and target
             body = {
                 "size": 0,
@@ -1407,6 +1418,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         if not self._indices_ready:
             return result
         try:
+            await self._refresh_graph_indices_if_dirty(refresh_edges=True)
             query = {
                 "bool": {
                     "should": [
@@ -1469,6 +1481,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             # No per-operation refresh: node reads use ID-based mget/exists
             # (translog, real-time). Search visibility after index_done_callback().
             await self.client.index(index=self._nodes_index, id=node_id, body=doc)
+            self._nodes_dirty = True
         except OpenSearchException as e:
             logger.error(f"[{self.workspace}] Error upserting node {node_id}: {e}")
 
@@ -1503,11 +1516,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             except OpenSearchException:
                 pass
 
-            # No per-operation refresh: the reverse-edge check above uses
-            # client.exists() which reads from the translog (real-time).
-            # Note: has_edge() and get_edge() use the search API, so they may
-            # not see this write until the next index_done_callback() refresh.
             await self.client.index(index=self._edges_index, id=edge_id, body=doc)
+            self._edges_dirty = True
         except OpenSearchException as e:
             logger.error(
                 f"[{self.workspace}] Error upserting edge {source_node_id}->{target_node_id}: {e}"
@@ -1538,6 +1548,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                     }
                 )
             await helpers.async_bulk(self.client, actions)
+            self._nodes_dirty = True
         except OpenSearchException as e:
             logger.error(f"[{self.workspace}] Error during batch node upsert: {e}")
 
@@ -1634,6 +1645,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                     }
                 )
             await helpers.async_bulk(self.client, actions)
+            self._edges_dirty = True
         except OpenSearchException as e:
             logger.error(f"[{self.workspace}] Error during batch edge upsert: {e}")
 
@@ -1642,12 +1654,13 @@ class OpenSearchGraphStorage(BaseGraphStorage):
     async def delete_node(self, node_id: str) -> None:
         """Delete a node and all its connected edges.
 
-        No per-operation refresh: delete_node is called from document deletion
-        pipelines that invoke index_done_callback() afterward.
-        Uses conflicts="proceed" to tolerate stale search views when prior
-        delete_by_query calls have already removed some edges.
+        Marks node and edge search views dirty so refresh happens lazily on the
+        next search/count-based graph read. Uses conflicts="proceed" to
+        tolerate already-deleted matches.
         """
         try:
+            # Refresh edge search view so delete_by_query sees all un-flushed writes.
+            await self._refresh_graph_indices_if_dirty(refresh_edges=True)
             # Delete all edges referencing this node
             body = {
                 "query": {
@@ -1660,27 +1673,33 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 }
             }
             await self.client.delete_by_query(
-                index=self._edges_index, body=body, params={"conflicts": "proceed"}
+                index=self._edges_index,
+                body=body,
+                params={"conflicts": "proceed"},
             )
             # Delete the node
             try:
                 await self.client.delete(index=self._nodes_index, id=node_id)
             except NotFoundError:
                 pass
+            self._nodes_dirty = True
+            self._edges_dirty = True
         except OpenSearchException as e:
             logger.error(f"[{self.workspace}] Error deleting node {node_id}: {e}")
 
     async def remove_nodes(self, nodes: list[str]) -> None:
         """Batch-delete multiple nodes and their connected edges.
 
-        No per-operation refresh: callers invoke index_done_callback() afterward.
-        Uses conflicts="proceed" to tolerate stale search views when prior
-        remove_edges() calls have already removed some edges without refresh.
+        Marks node and edge search views dirty so refresh happens lazily on the
+        next search/count-based graph read. Uses conflicts="proceed" to
+        tolerate already-deleted matches.
         """
         if not nodes:
             return
         logger.info(f"[{self.workspace}] Deleting {len(nodes)} nodes")
         try:
+            # Refresh edge search view so delete_by_query sees all un-flushed writes.
+            await self._refresh_graph_indices_if_dirty(refresh_edges=True)
             # Delete edges
             body = {
                 "query": {
@@ -1693,7 +1712,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 }
             }
             await self.client.delete_by_query(
-                index=self._edges_index, body=body, params={"conflicts": "proceed"}
+                index=self._edges_index,
+                body=body,
+                params={"conflicts": "proceed"},
             )
             # Delete nodes
             actions = [
@@ -1701,46 +1722,43 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 for nid in nodes
             ]
             await helpers.async_bulk(self.client, actions, raise_on_error=False)
+            self._nodes_dirty = True
+            self._edges_dirty = True
         except OpenSearchException as e:
             logger.error(f"[{self.workspace}] Error removing nodes: {e}")
 
     async def remove_edges(self, edges: list[tuple[str, str]]) -> None:
-        """Batch-delete multiple edges (bidirectional matching).
+        """Batch-delete multiple edges by deterministic ID (real-time).
 
-        No per-operation refresh: callers invoke index_done_callback() afterward.
-        Uses conflicts="proceed" to tolerate stale search views when
-        subsequent remove_nodes() may target already-deleted edges.
+        Each edge is stored under one of two candidate IDs:
+          forward  = compute_mdhash_id("src-tgt", prefix="edge-")
+          reverse  = compute_mdhash_id("tgt-src", prefix="edge-")
+        We delete both candidates for every requested edge so the deletion
+        is effective regardless of which direction was stored.
+
+        Marks edge search views dirty so refresh happens lazily on the next
+        search/count-based graph read.
         """
         if not edges:
             return
         logger.info(f"[{self.workspace}] Deleting {len(edges)} edges")
         try:
-            should_clauses = []
+            operations = []
             for src, tgt in edges:
-                should_clauses.append(
-                    {
-                        "bool": {
-                            "must": [
-                                {"term": {"source_node_id": src}},
-                                {"term": {"target_node_id": tgt}},
-                            ]
+                for edge_id in (
+                    compute_mdhash_id(f"{src}-{tgt}", prefix="edge-"),
+                    compute_mdhash_id(f"{tgt}-{src}", prefix="edge-"),
+                ):
+                    operations.append(
+                        {
+                            "delete": {
+                                "_index": self._edges_index,
+                                "_id": edge_id,
+                            }
                         }
-                    }
-                )
-                should_clauses.append(
-                    {
-                        "bool": {
-                            "must": [
-                                {"term": {"source_node_id": tgt}},
-                                {"term": {"target_node_id": src}},
-                            ]
-                        }
-                    }
-                )
-            body = {"query": {"bool": {"should": should_clauses}}}
-            await self.client.delete_by_query(
-                index=self._edges_index, body=body, params={"conflicts": "proceed"}
-            )
+                    )
+            await self.client.bulk(body=operations)
+            self._edges_dirty = True
         except OpenSearchException as e:
             logger.error(f"[{self.workspace}] Error removing edges: {e}")
 
@@ -1751,6 +1769,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         if not self._indices_ready:
             return []
         try:
+            await self._refresh_graph_indices_if_dirty(refresh_nodes=True)
             labels = []
             pit = await self.client.create_pit(
                 index=self._nodes_index, params={"keep_alive": "1m"}
@@ -1788,6 +1807,129 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             if _is_missing_index_error(e):
                 self._mark_indices_missing()
             return []
+
+    async def _collect_node_ids(
+        self, limit: int, exclude_ids: set[str] | None = None
+    ) -> list[str]:
+        """Collect up to `limit` node IDs, optionally skipping known IDs."""
+        if limit <= 0:
+            return []
+
+        excluded = exclude_ids or set()
+        if not excluded and limit <= 10000:
+            body = {
+                "query": {"match_all": {}},
+                "_source": False,
+                "size": limit,
+            }
+            resp = await self.client.search(index=self._nodes_index, body=body)
+            return [hit["_id"] for hit in resp["hits"]["hits"]]
+
+        node_ids: list[str] = []
+        pit = await self.client.create_pit(
+            index=self._nodes_index, params={"keep_alive": "1m"}
+        )
+        pit_id = pit["pit_id"]
+        try:
+            search_after = None
+            while len(node_ids) < limit:
+                body = {
+                    "query": {"match_all": {}},
+                    "_source": False,
+                    "size": 10000,
+                    "pit": {"id": pit_id, "keep_alive": "1m"},
+                    "sort": [{"_shard_doc": "asc"}],
+                }
+                if search_after:
+                    body["search_after"] = search_after
+                resp = await self.client.search(body=body)
+                hits = resp["hits"]["hits"]
+                if not hits:
+                    break
+                for hit in hits:
+                    node_id = hit["_id"]
+                    if node_id in excluded:
+                        continue
+                    node_ids.append(node_id)
+                    if len(node_ids) >= limit:
+                        break
+                search_after = hits[-1].get("sort")
+                if len(hits) < 10000:
+                    break
+        finally:
+            try:
+                await self.client.delete_pit(body={"pit_id": [pit_id]})
+            except Exception:
+                pass
+
+        return node_ids
+
+    @staticmethod
+    def _edge_rank_key(edge: dict[str, Any]) -> tuple[int, float]:
+        """Rank traversal edges by shallower depth first, then higher weight."""
+        depth = edge.get("_depth", edge.get("depth", 0))
+        try:
+            depth_value = int(depth)
+        except (TypeError, ValueError):
+            depth_value = 0
+
+        weight = edge.get("weight", 0)
+        try:
+            weight_value = float(weight)
+        except (TypeError, ValueError):
+            weight_value = 0.0
+
+        return (depth_value, -weight_value)
+
+    async def _append_edges_between_nodes(
+        self, node_ids: list[str], result: KnowledgeGraph
+    ) -> None:
+        """Append all edges whose source and target are both in `node_ids`."""
+        if not node_ids:
+            return
+
+        edge_query = {
+            "bool": {
+                "must": [
+                    {"terms": {"source_node_id": node_ids}},
+                    {"terms": {"target_node_id": node_ids}},
+                ]
+            }
+        }
+        seen_edges = set()
+        pit = await self.client.create_pit(
+            index=self._edges_index, params={"keep_alive": "1m"}
+        )
+        pit_id = pit["pit_id"]
+        try:
+            search_after = None
+            while True:
+                edge_body = {
+                    "query": edge_query,
+                    "size": 10000,
+                    "pit": {"id": pit_id, "keep_alive": "1m"},
+                    "sort": [{"_shard_doc": "asc"}],
+                }
+                if search_after:
+                    edge_body["search_after"] = search_after
+                edge_resp = await self.client.search(body=edge_body)
+                hits = edge_resp["hits"]["hits"]
+                if not hits:
+                    break
+                for hit in hits:
+                    e = hit["_source"]
+                    eid = f"{e['source_node_id']}-{e['target_node_id']}"
+                    if eid not in seen_edges:
+                        seen_edges.add(eid)
+                        result.edges.append(self._construct_graph_edge(eid, e))
+                search_after = hits[-1].get("sort")
+                if len(hits) < 10000:
+                    break
+        finally:
+            try:
+                await self.client.delete_pit(body={"pit_id": [pit_id]})
+            except Exception:
+                pass
 
     def _construct_graph_node(self, node_id, node_data: dict) -> KnowledgeGraphNode:
         return KnowledgeGraphNode(
@@ -1845,6 +1987,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         start = time.perf_counter()
 
         try:
+            await self._refresh_graph_indices_if_dirty(
+                refresh_nodes=True, refresh_edges=True
+            )
             if node_label == "*":
                 result = await self._get_knowledge_graph_all(max_nodes)
             elif self._ppl_graphlookup_available:
@@ -1906,84 +2051,29 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 top_ids = sorted(degree_map, key=degree_map.get, reverse=True)[
                     :max_nodes
                 ]
-            else:
-                # Get all node IDs — use PIT scrolling if max_nodes > 10000
-                top_ids = []
-                if max_nodes <= 10000:
-                    body = {
-                        "query": {"match_all": {}},
-                        "_source": False,
-                        "size": max_nodes,
-                    }
-                    resp = await self.client.search(index=self._nodes_index, body=body)
-                    top_ids = [hit["_id"] for hit in resp["hits"]["hits"]]
-                else:
-                    pit = await self.client.create_pit(
-                        index=self._nodes_index, params={"keep_alive": "1m"}
+                if len(top_ids) < max_nodes:
+                    top_ids.extend(
+                        await self._collect_node_ids(
+                            max_nodes - len(top_ids), exclude_ids=set(top_ids)
+                        )
                     )
-                    pit_id = pit["pit_id"]
-                    try:
-                        search_after = None
-                        while len(top_ids) < max_nodes:
-                            body = {
-                                "query": {"match_all": {}},
-                                "_source": False,
-                                "size": 10000,
-                                "pit": {"id": pit_id, "keep_alive": "1m"},
-                                "sort": [{"_shard_doc": "asc"}],
-                            }
-                            if search_after:
-                                body["search_after"] = search_after
-                            resp = await self.client.search(body=body)
-                            hits = resp["hits"]["hits"]
-                            if not hits:
-                                break
-                            for hit in hits:
-                                top_ids.append(hit["_id"])
-                                if len(top_ids) >= max_nodes:
-                                    break
-                            search_after = hits[-1]["sort"]
-                            if len(hits) < 10000:
-                                break
-                    finally:
-                        try:
-                            await self.client.delete_pit(body={"pit_id": [pit_id]})
-                        except Exception:
-                            pass
+            else:
+                top_ids = await self._collect_node_ids(max_nodes)
 
             # Fetch node data
             if top_ids:
                 node_resp = await self.client.mget(
                     index=self._nodes_index, body={"ids": top_ids}
                 )
+                found_node_ids = []
                 for doc in node_resp["docs"]:
                     if doc.get("found"):
+                        found_node_ids.append(doc["_id"])
                         result.nodes.append(
                             self._construct_graph_node(doc["_id"], doc["_source"])
                         )
 
-                # Fetch edges between these nodes
-                edge_body = {
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"terms": {"source_node_id": top_ids}},
-                                {"terms": {"target_node_id": top_ids}},
-                            ]
-                        }
-                    },
-                    "size": 10000,
-                }
-                edge_resp = await self.client.search(
-                    index=self._edges_index, body=edge_body
-                )
-                seen_edges = set()
-                for hit in edge_resp["hits"]["hits"]:
-                    e = hit["_source"]
-                    eid = f"{e['source_node_id']}-{e['target_node_id']}"
-                    if eid not in seen_edges:
-                        seen_edges.add(eid)
-                        result.edges.append(self._construct_graph_edge(eid, e))
+                await self._append_edges_between_nodes(found_node_ids, result)
         except OpenSearchException as e:
             if _is_missing_index_error(e):
                 self._mark_indices_missing()
@@ -2007,7 +2097,6 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         if not start_node:
             return result
 
-        seen_nodes = {start_label}
         result.nodes.append(self._construct_graph_node(start_label, start_node))
 
         if max_depth == 0:
@@ -2058,17 +2147,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             if not all_edge_rows:
                 return result
 
-            # Build field index map from the first edge row if it's a dict,
-            # otherwise fall back to known edge schema order
             if isinstance(all_edge_rows[0], dict):
-                # Dict-based response (ideal)
-                for edge_row in all_edge_rows:
-                    src = edge_row.get("source_node_id")
-                    tgt = edge_row.get("target_node_id")
-                    if src:
-                        seen_nodes.add(src)
-                    if tgt:
-                        seen_nodes.add(tgt)
+                sorted_edge_rows = sorted(all_edge_rows, key=self._edge_rank_key)
             else:
                 # Positional array — column positions are unknown, fall back to client BFS
                 logger.warning(
@@ -2082,12 +2162,23 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             )
             return await self._bfs_subgraph(start_label, max_depth, max_nodes)
 
-        # Limit to max_nodes
-        node_ids = list(seen_nodes)[:max_nodes]
-        result.is_truncated = len(seen_nodes) > max_nodes
+        ordered_node_ids = [start_label]
+        discovered_nodes = {start_label}
+        for edge_row in sorted_edge_rows:
+            for node_id in (
+                edge_row.get("source_node_id"),
+                edge_row.get("target_node_id"),
+            ):
+                if not node_id or node_id in discovered_nodes:
+                    continue
+                discovered_nodes.add(node_id)
+                if len(ordered_node_ids) < max_nodes:
+                    ordered_node_ids.append(node_id)
+
+        result.is_truncated = len(discovered_nodes) > max_nodes
 
         # Batch fetch node data (start node already added)
-        new_node_ids = [nid for nid in node_ids if nid != start_label]
+        new_node_ids = [nid for nid in ordered_node_ids if nid != start_label]
         if new_node_ids:
             node_resp = await self.client.mget(
                 index=self._nodes_index, body={"ids": new_node_ids}
@@ -2098,29 +2189,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                         self._construct_graph_node(doc["_id"], doc["_source"])
                     )
 
-        # Re-fetch full edge data between collected nodes for complete properties
-        if node_ids:
-            edge_body = {
-                "query": {
-                    "bool": {
-                        "must": [
-                            {"terms": {"source_node_id": node_ids}},
-                            {"terms": {"target_node_id": node_ids}},
-                        ]
-                    }
-                },
-                "size": 10000,
-            }
-            edge_resp = await self.client.search(
-                index=self._edges_index, body=edge_body
-            )
-            seen_edges = set()
-            for hit in edge_resp["hits"]["hits"]:
-                e = hit["_source"]
-                eid = f"{e['source_node_id']}-{e['target_node_id']}"
-                if eid not in seen_edges:
-                    seen_edges.add(eid)
-                    result.edges.append(self._construct_graph_edge(eid, e))
+        await self._append_edges_between_nodes(ordered_node_ids, result)
 
         return result
 
@@ -2200,49 +2269,8 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         # Fetch all edges between seen nodes using PIT scrolling
         all_ids = list(seen_nodes)
         if all_ids:
-            edge_query = {
-                "bool": {
-                    "must": [
-                        {"terms": {"source_node_id": all_ids}},
-                        {"terms": {"target_node_id": all_ids}},
-                    ]
-                }
-            }
             try:
-                seen_edges = set()
-                pit = await self.client.create_pit(
-                    index=self._edges_index, params={"keep_alive": "1m"}
-                )
-                pit_id = pit["pit_id"]
-                try:
-                    search_after = None
-                    while True:
-                        edge_body = {
-                            "query": edge_query,
-                            "size": 10000,
-                            "pit": {"id": pit_id, "keep_alive": "1m"},
-                            "sort": [{"_shard_doc": "asc"}],
-                        }
-                        if search_after:
-                            edge_body["search_after"] = search_after
-                        edge_resp = await self.client.search(body=edge_body)
-                        hits = edge_resp["hits"]["hits"]
-                        if not hits:
-                            break
-                        for hit in hits:
-                            e = hit["_source"]
-                            eid = f"{e['source_node_id']}-{e['target_node_id']}"
-                            if eid not in seen_edges:
-                                seen_edges.add(eid)
-                                result.edges.append(self._construct_graph_edge(eid, e))
-                        search_after = hits[-1]["sort"]
-                        if len(hits) < 10000:
-                            break
-                finally:
-                    try:
-                        await self.client.delete_pit(body={"pit_id": [pit_id]})
-                    except Exception:
-                        pass
+                await self._append_edges_between_nodes(all_ids, result)
             except OpenSearchException:
                 pass
 
@@ -2254,6 +2282,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         if not self._indices_ready:
             return []
         try:
+            await self._refresh_graph_indices_if_dirty(refresh_nodes=True)
             nodes = []
             pit = await self.client.create_pit(
                 index=self._nodes_index, params={"keep_alive": "1m"}
@@ -2297,6 +2326,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         if not self._indices_ready:
             return []
         try:
+            await self._refresh_graph_indices_if_dirty(refresh_edges=True)
             edges = []
             pit = await self.client.create_pit(
                 index=self._edges_index, params={"keep_alive": "1m"}
@@ -2341,6 +2371,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         if not self._indices_ready:
             return []
         try:
+            await self._refresh_graph_indices_if_dirty(refresh_edges=True)
             body = {
                 "size": 0,
                 "aggs": {
@@ -2373,6 +2404,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         if not self._indices_ready:
             return []
         try:
+            await self._refresh_graph_indices_if_dirty(refresh_nodes=True)
             body = {
                 "query": {
                     "bool": {
@@ -2410,8 +2442,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         if not self._indices_ready:
             return
         try:
-            await self.client.indices.refresh(index=self._nodes_index)
-            await self.client.indices.refresh(index=self._edges_index)
+            await self._refresh_graph_indices_if_dirty(
+                refresh_nodes=True, refresh_edges=True
+            )
         except OpenSearchException as e:
             if _is_missing_index_error(e):
                 self._mark_indices_missing()
