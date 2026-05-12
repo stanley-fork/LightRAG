@@ -299,7 +299,7 @@ LightRAG integrates with [RAG-Anything](https://github.com/HKUDS/RAG-Anything) f
 
 > LightRAG Server will soon integrate RAG-Anything’s multimodal processing capabilities into its file processing pipeline. Stay tuned.
 
-## Replicating Findings in the Papper
+## Replicating Findings in the Paper
 
 LightRAG consistently outperforms NaiveRAG, RQ-RAG, HyDE, and GraphRAG across agriculture, computer science, legal, and mixed domains. For the full evaluation methodology, prompts, and reproduce steps, see **[docs/Reproduce.md](./docs/Reproduce.md)**.
 
