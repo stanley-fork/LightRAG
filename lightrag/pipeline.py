@@ -1486,6 +1486,10 @@ class _PipelineMixin:
                     status_doc=status_doc_w,
                     file_path=file_path_w,
                 )
+                async with ctx.pipeline_status_lock:
+                    log_message = f"Parsing ({engine}): {doc_id_w}"
+                    ctx.pipeline_status["latest_message"] = log_message
+                    ctx.pipeline_status["history_messages"].append(log_message)
                 if engine == "mineru":
                     parsed_data_w = await self.parse_mineru(
                         doc_id_w, file_path_w, content_data_w
@@ -1592,6 +1596,8 @@ class _PipelineMixin:
                     doc_id=doc_id_w,
                     file_path=file_path_w,
                     parsed_data=parsed_data_w,
+                    pipeline_status=ctx.pipeline_status,
+                    pipeline_status_lock=ctx.pipeline_status_lock,
                 )
                 await ctx.q_process.put((doc_id_w, status_doc_w, analyzed))
             except Exception as e:
@@ -3486,6 +3492,8 @@ class _PipelineMixin:
         parsed_data: dict[str, Any],
         *,
         process_options: str | None = None,
+        pipeline_status: dict | None = None,
+        pipeline_status_lock: Any | None = None,
     ) -> dict[str, Any]:
         """Phase 2: Multimodal analysis (VLM). Writes llm_analyze_result to LightRAG Document.
 
@@ -4127,6 +4135,34 @@ class _PipelineMixin:
                     existing.append(cache_id)
                 item_obj["llm_cache_list"] = existing
 
+            async def _run_with_progress_log(coro, kind: str, item_id: str):
+                """Append per-item completion log to pipeline_status the moment
+                this single ``_analyze_*`` task finishes — not after the whole
+                ``asyncio.gather`` batch returns — so the UI sees each
+                drawing/table/equation result land in real time."""
+                try:
+                    result = await coro
+                except Exception:
+                    if pipeline_status is not None and pipeline_status_lock is not None:
+                        async with pipeline_status_lock:
+                            log_message = f"Analyzing {kind}/{item_id}: failed"
+                            pipeline_status["latest_message"] = log_message
+                            pipeline_status["history_messages"].append(log_message)
+                    raise
+                if pipeline_status is not None and pipeline_status_lock is not None:
+                    result_obj = result[0] if isinstance(result, tuple) else {}
+                    item_status = (
+                        "ok"
+                        if isinstance(result_obj, dict)
+                        and result_obj.get("status") == "success"
+                        else "skipped"
+                    )
+                    async with pipeline_status_lock:
+                        log_message = f"Analyzing  {kind}/{item_id}: {item_status}"
+                        pipeline_status["latest_message"] = log_message
+                        pipeline_status["history_messages"].append(log_message)
+                return result
+
             base_name = str(block_file)
             if base_name.endswith(".blocks.jsonl"):
                 base_name = base_name[: -len(".blocks.jsonl")]
@@ -4150,6 +4186,7 @@ class _PipelineMixin:
                     process_opts.equations,
                 ),
             ]
+            start_logged = False
             for sidecar_path, root_key, kind, enabled in sidecars:
                 if not enabled or not sidecar_path.exists():
                     continue
@@ -4163,6 +4200,18 @@ class _PipelineMixin:
                 if not isinstance(items, dict):
                     continue
 
+                if (
+                    items
+                    and not start_logged
+                    and pipeline_status is not None
+                    and pipeline_status_lock is not None
+                ):
+                    async with pipeline_status_lock:
+                        log_message = f"Analyzing multimodal: {doc_id}"
+                        pipeline_status["latest_message"] = log_message
+                        pipeline_status["history_messages"].append(log_message)
+                    start_logged = True
+
                 valid_keys: list[str] = []
                 analyze_tasks: list[Any] = []
                 for item_id, item in items.items():
@@ -4170,13 +4219,14 @@ class _PipelineMixin:
                         continue
                     valid_keys.append(item_id)
                     if kind == "drawing":
-                        analyze_tasks.append(
-                            _analyze_drawing(item_id, item, sidecar_path.parent)
+                        inner_coro = _analyze_drawing(
+                            item_id, item, sidecar_path.parent
                         )
                     else:
-                        analyze_tasks.append(
-                            _analyze_text_modality(kind, item_id, item)
-                        )
+                        inner_coro = _analyze_text_modality(kind, item_id, item)
+                    analyze_tasks.append(
+                        _run_with_progress_log(inner_coro, kind, item_id)
+                    )
 
                 analyzed = await asyncio.gather(*analyze_tasks, return_exceptions=True)
 
@@ -4190,8 +4240,7 @@ class _PipelineMixin:
                         item["llm_analyze_result"] = _failure_result(str(outcome))
                         if failure_to_raise is None:
                             failure_to_raise = outcome
-                        continue
-                    if isinstance(outcome, Exception):
+                    elif isinstance(outcome, Exception):
                         item["llm_analyze_result"] = _failure_result(
                             f"unexpected error: {outcome}"
                         )
@@ -4199,10 +4248,10 @@ class _PipelineMixin:
                             failure_to_raise = MultimodalAnalysisError(
                                 f"{root_key}/{item_id}: unexpected error: {outcome}"
                             )
-                        continue
-                    result_obj, cache_id = outcome
-                    item["llm_analyze_result"] = result_obj
-                    _attach_cache_id(item, cache_id)
+                    else:
+                        result_obj, cache_id = outcome
+                        item["llm_analyze_result"] = result_obj
+                        _attach_cache_id(item, cache_id)
                 try:
                     sidecar_path.write_text(
                         json.dumps(payload, ensure_ascii=False, indent=2),
