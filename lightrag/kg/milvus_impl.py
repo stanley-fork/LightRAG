@@ -1694,6 +1694,14 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         Server-side failures are re-raised (no log-and-swallow): the caller
         decides whether to retry.
 
+        Buffer semantics — post-prune with caller short-circuit contract:
+            Matching pending upserts in ``_pending_vector_docs`` are
+            pruned **only after** the server-side query + delete
+            succeeds. On failure the pending buffer stays intact and
+            the exception propagates so the caller (``adelete_by_entity``
+            in ``utils_graph.py``) can short-circuit before
+            ``_persist_graph_updates`` flushes a half-cleaned buffer.
+
         Semantic note (deferred-buffer ↔ persisted divergence): pruning only
         consults the *current* buffered ``src_id`` / ``tgt_id`` view; we do
         not re-read the persisted row a buffered upsert is about to
@@ -1706,8 +1714,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         that require eager-equivalent semantics should call
         ``index_done_callback()`` before ``delete_entity_relation``.
         """
-        async with self._flush_lock:
-            # Prune matching docs from the pending upsert buffer.
+
+        def _prune_pending() -> None:
             for doc_id in [
                 k
                 for k, v in self._pending_vector_docs.items()
@@ -1716,7 +1724,11 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             ]:
                 self._pending_vector_docs.pop(doc_id, None)
 
+        async with self._flush_lock:
             if self._client is None:
+                # No server state to mutate; buffer prune is the only
+                # delete intent we can record.
+                _prune_pending()
                 return
 
             self._ensure_collection_loaded()
@@ -1729,6 +1741,9 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             )
 
             if not results:
+                # No server rows to delete — still safe to prune any
+                # pending upserts so they can't re-create the relation.
+                _prune_pending()
                 logger.debug(
                     f"[{self.workspace}] No relations found for entity {entity_name}"
                 )
@@ -1736,6 +1751,10 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
             relation_ids = [item["id"] for item in results]
             self._client.delete(collection_name=self.final_namespace, pks=relation_ids)
+            # Server-side delete succeeded — safe to prune the pending
+            # buffer so subsequent flushes don't re-upsert the deleted
+            # relations.
+            _prune_pending()
             logger.debug(
                 f"[{self.workspace}] Deleted {len(relation_ids)} relations for {entity_name}"
             )
@@ -1968,42 +1987,23 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             )
 
     async def drop(self) -> dict[str, str]:
-        """Drop all vector data from storage and clean up resources
+        """Drop all data from the Milvus collection. Destructive.
 
-        This method will delete all data from the Milvus collection.
+        MUST only be called when ``pipeline_status`` is idle (see the
+        Pipeline concurrency contract in ``AGENTS.md``); the only
+        in-tree caller ``clear_documents`` enforces this.
 
-        Known limitation — multi-instance aliasing: we only clear *this*
-        instance's ``_pending_vector_docs`` / ``_pending_vector_deletes``.
-        The namespace lock (keyed on ``final_namespace``) serializes the
-        drop+recreate against a concurrent flush, but it does not
-        invalidate process-local buffers held by *other*
-        ``MilvusVectorDBStorage`` instances that share the same
-        ``final_namespace`` — e.g. multi-worker deployments where each
-        process holds its own instance, or distinct namespaces aliased
-        onto one collection by ``MILVUS_WORKSPACE``. A sibling whose
-        previous ``index_done_callback()`` raised (which by contract
-        leaves its buffers intact for retry) will, on its next flush,
-        acquire the same namespace lock and upsert those stale rows
-        into the *newly recreated* collection — silently undoing the
-        drop.
-
-        Safe under the current calling contract: the only caller,
-        ``clear_documents`` in ``lightrag/api/routers/document_routes.py``,
-        reserves the destructive slot only when ``pipeline_status`` is
-        idle (``busy=False``, ``scanning=False``, ``pending_enqueues==0``;
-        see the Pipeline concurrency contract in ``AGENTS.md``). With
-        the pipeline idle no in-flight ingestion is queueing new
-        buffered writes, and the only sibling state that could still
-        be dirty is a buffer left over from a previously-failed flush
-        — accepted as a rare residual risk rather than fixed by a
-        cross-instance invalidation token. Any future direct caller of
-        ``drop()`` that bypasses this idle precondition MUST flush
-        every aliased instance itself before calling.
+        Caveat — only this instance's buffers are cleared. Other
+        ``MilvusVectorDBStorage`` instances aliased onto the same
+        ``final_namespace`` (multi-worker processes, or distinct
+        workspaces collapsed by ``MILVUS_WORKSPACE``) keep their own
+        buffers; a sibling whose prior flush failed and left buffers
+        intact will, on its next flush, upsert those stale rows into
+        the freshly recreated collection. Direct callers bypassing the
+        idle precondition MUST flush every aliased instance first.
 
         Returns:
-            dict[str, str]: Operation status and message
-            - On success: {"status": "success", "message": "data dropped"}
-            - On failure: {"status": "error", "message": "<error details>"}
+            dict[str, str]: ``{"status": "success"|"error", "message": str}``
         """
         try:
             async with self._flush_lock:
