@@ -54,20 +54,20 @@ DEFAULT_MIN_RERANK_SCORE = 0.0
 DEFAULT_RERANK_BINDING = "null"
 
 # Default source ids limit in meta data for entity and relation
-DEFAULT_MAX_SOURCE_IDS_PER_ENTITY = 300
-DEFAULT_MAX_SOURCE_IDS_PER_RELATION = 300
+DEFAULT_MAX_SOURCE_IDS_PER_ENTITY = 200
+DEFAULT_MAX_SOURCE_IDS_PER_RELATION = 200
 ### control chunk_ids limitation method: FIFO, FIFO
 ###    FIFO: First in first out
 ###    KEEP: Keep oldest (less merge action and faster)
 SOURCE_IDS_LIMIT_METHOD_KEEP = "KEEP"
 SOURCE_IDS_LIMIT_METHOD_FIFO = "FIFO"
-DEFAULT_SOURCE_IDS_LIMIT_METHOD = SOURCE_IDS_LIMIT_METHOD_FIFO
+DEFAULT_SOURCE_IDS_LIMIT_METHOD = SOURCE_IDS_LIMIT_METHOD_KEEP
 VALID_SOURCE_IDS_LIMIT_METHODS = {
     SOURCE_IDS_LIMIT_METHOD_KEEP,
     SOURCE_IDS_LIMIT_METHOD_FIFO,
 }
 # Maximum number of file paths stored in entity/relation file_path field (For displayed only, does not affect query performance)
-DEFAULT_MAX_FILE_PATHS = 100
+DEFAULT_MAX_FILE_PATHS = 75
 
 # Field length of file_path in Milvus Schema for entity and relation (Should not be changed)
 # file_path must store all file paths up to the DEFAULT_MAX_FILE_PATHS limit within the metadata.
