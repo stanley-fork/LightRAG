@@ -45,6 +45,7 @@ from lightrag.sidecar.placeholders import (
     render_template,
     table_body_for_rows,
 )
+from lightrag.table_markup import header_grid_to_thead_html
 from lightrag.utils import logger
 
 
@@ -219,7 +220,9 @@ def write_sidecar(
                     table.placeholder_key,
                 )
                 continue
-            tables[tb_id] = _table_item_dict(tb_id, blockid, block.heading, table)
+            tables[tb_id] = _table_item_dict(
+                tb_id, blockid, block.heading, block.parent_headings, table
+            )
         for drawing in block.drawings:
             im_id = drawing_id_by_key[drawing.placeholder_key]
             if im_id not in rendered:
@@ -233,7 +236,13 @@ def write_sidecar(
                 )
                 continue
             drawings[im_id] = _drawing_item_dict(
-                im_id, blockid, block.heading, drawing, asset_paths, asset_prefix
+                im_id,
+                blockid,
+                block.heading,
+                block.parent_headings,
+                drawing,
+                asset_paths,
+                asset_prefix,
             )
         for equation in block.equations:
             if not equation.is_block:
@@ -250,7 +259,7 @@ def write_sidecar(
                 )
                 continue
             equations[eq_id] = _equation_item_dict(
-                eq_id, blockid, block.heading, equation
+                eq_id, blockid, block.heading, block.parent_headings, equation
             )
 
         row: dict[str, Any] = {
@@ -528,6 +537,7 @@ def _table_item_dict(
     table_id: str,
     blockid: str,
     heading: str,
+    parent_headings: list[str],
     table: IRTable,
 ) -> dict[str, Any]:
     if table.rows is not None:
@@ -541,6 +551,7 @@ def _table_item_dict(
         "id": table_id,
         "blockid": blockid,
         "heading": heading,
+        "parent_headings": list(parent_headings),
         "dimension": [int(table.num_rows), int(table.num_cols)],
         "format": fmt,
         "content": content,
@@ -548,8 +559,23 @@ def _table_item_dict(
         "footnotes": list(table.footnotes),
     }
     if table.table_header is not None:
-        # Spec §5: stored as JSON string.
-        item["table_header"] = json.dumps(table.table_header, ensure_ascii=False)
+        # The header's stored format follows the table's format (spec §5):
+        #   * HTML tables → a raw ``<thead>…</thead>`` string stored verbatim so
+        #     merged cells (``rowspan``/``colspan``) survive; a grid supplied for
+        #     an HTML table is rendered to a (span-less) ``<thead>`` as fallback.
+        #   * JSON tables → a JSON 2-D array string.
+        if fmt == "html":
+            if isinstance(table.table_header, str):
+                item["table_header"] = table.table_header
+            else:
+                item["table_header"] = header_grid_to_thead_html(table.table_header)
+        elif isinstance(table.table_header, str):
+            raise ValueError(
+                f"JSON table {table_id!r} has a string table_header "
+                f"({table.table_header[:40]!r}…); JSON tables require a 2-D grid"
+            )
+        else:
+            item["table_header"] = json.dumps(table.table_header, ensure_ascii=False)
     if table.self_ref:
         item["self_ref"] = table.self_ref
     if table.extras:
@@ -561,6 +587,7 @@ def _drawing_item_dict(
     drawing_id: str,
     blockid: str,
     heading: str,
+    parent_headings: list[str],
     drawing: IRDrawing,
     asset_paths: dict[str, str],
     asset_prefix: str,
@@ -574,6 +601,7 @@ def _drawing_item_dict(
         "id": drawing_id,
         "blockid": blockid,
         "heading": heading,
+        "parent_headings": list(parent_headings),
         "format": drawing.fmt,
         "path": path,
         "src": drawing.src,
@@ -609,12 +637,14 @@ def _equation_item_dict(
     eq_id: str,
     blockid: str,
     heading: str,
+    parent_headings: list[str],
     equation: IREquation,
 ) -> dict[str, Any]:
     item: dict[str, Any] = {
         "id": eq_id,
         "blockid": blockid,
         "heading": heading,
+        "parent_headings": list(parent_headings),
         "format": "latex",
         "content": _strip_latex_dollar_wrappers(equation.latex),
         "caption": equation.caption,
