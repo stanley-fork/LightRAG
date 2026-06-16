@@ -44,6 +44,7 @@ from lightrag.parser.routing import (
     FilenameParserHintError,
     canonicalize_parser_hinted_basename,
     chunk_strategy_key,
+    encode_parse_engine,
     filename_parser_hint,
     parse_process_options,
     resolve_chunk_options,
@@ -294,7 +295,11 @@ class RecursiveCharacterChunkParams(_OverlapChunkParams):
 
 
 class ParagraphSemanticChunkParams(_OverlapChunkParams):
-    pass
+    # Drop the trailing reference section before chunking. ``None`` means
+    # "not supplied — inherit the addon_params/env default at process time".
+    # Detection-tuning knobs (tail window / heading prefixes) are env-only and
+    # read live by the chunker, so they are intentionally not exposed here.
+    drop_references: Optional[bool] = None
 
 
 class SemanticVectorChunkParams(_StrictChunkParams):
@@ -1672,12 +1677,18 @@ async def pipeline_enqueue_file(
         # saved on disk, so we enqueue PENDING_PARSE with the chosen engine.
         # Legacy now extracts at the worker (LegacyParser) instead of eagerly
         # here, so every engine shares one ingestion path.
+        # Encode any per-file engine params into the parse_engine field
+        # (e.g. "mineru(page_range=1-3,language=en)") so they ride the existing
+        # persisted column to the parse worker. Bare engine when there are none.
+        parse_engine_field = encode_parse_engine(
+            extraction_engine, directives.engine_params
+        )
         try:
             enqueue_kwargs = {
                 "file_paths": str(file_path),
                 "track_id": track_id,
                 "docs_format": FULL_DOCS_FORMAT_PENDING_PARSE,
-                "parse_engine": extraction_engine,
+                "parse_engine": parse_engine_field,
                 "process_options": api_process_options,
                 "from_scan": from_scan,
             }
