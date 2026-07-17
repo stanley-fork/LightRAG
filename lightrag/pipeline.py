@@ -93,6 +93,7 @@ from lightrag.utils_pipeline import (
     build_chunks_dict_from_chunking_result,
     chunk_fields_from_status_doc,
     compute_text_content_hash,
+    doc_status_custom_chunk_patch,
     doc_status_field,
     doc_status_parse_failure_fields,
     doc_status_transition_metadata,
@@ -1131,8 +1132,6 @@ class _PipelineMixin:
                             == "internal_error"
                         )
                         label = self._cancellation_label(pipeline_status)
-                        pipeline_status["request_pending"] = False
-                        pipeline_status["cancellation_requested"] = False
 
                         if is_internal:
                             # Unrecoverable storage error: halting is intentional
@@ -1146,10 +1145,16 @@ class _PipelineMixin:
                         else:
                             log_message = f"Pipeline cancelled ({label})"
                             logger.info(log_message)
-                        pipeline_status["latest_message"] = log_message
+                        pipeline_status.update(
+                            {
+                                "request_pending": False,
+                                "cancellation_requested": False,
+                                "cancellation_reason": None,
+                                "cancellation_detail": None,
+                                "latest_message": log_message,
+                            }
+                        )
                         pipeline_status["history_messages"].append(log_message)
-                        pipeline_status["cancellation_reason"] = None
-                        pipeline_status["cancellation_detail"] = None
 
                         # Exit directly, skipping request_pending check
                         return
@@ -1193,10 +1198,14 @@ class _PipelineMixin:
 
                 log_message = f"Processing {len(to_process_docs)} document(s)"
                 logger.info(log_message)
-                pipeline_status["docs"] = len(to_process_docs)
-                pipeline_status["batchs"] = len(to_process_docs)
-                pipeline_status["cur_batch"] = 0
-                pipeline_status["latest_message"] = log_message
+                pipeline_status.update(
+                    {
+                        "docs": len(to_process_docs),
+                        "batchs": len(to_process_docs),
+                        "cur_batch": 0,
+                        "latest_message": log_message,
+                    }
+                )
                 pipeline_status["history_messages"].append(log_message)
 
                 await self._run_pipeline_batch(
@@ -1491,6 +1500,30 @@ class _PipelineMixin:
         pipeline_status_lock: asyncio.Lock,
     ) -> dict[str, DocProcessingStatus]:
         """Validate and fix document data consistency by deleting inconsistent entries, but preserve failed documents"""
+        # Documents carrying a custom-chunk patch journal belong to an
+        # in-flight or failed ainsert_custom_chunks operation (issue #3400
+        # Phase 3). Ordinary pipeline processing must not touch them: a reset
+        # would strip the journal and rebuild the whole document, discarding
+        # the operation's recovery anchor. They are resumed by the SDK caller
+        # (same call) or rolled back by /documents/scan.
+        journaled_patch_docs = [
+            doc_id
+            for doc_id, status_doc in to_process_docs.items()
+            if doc_status_custom_chunk_patch(status_doc) is not None
+        ]
+        if journaled_patch_docs:
+            for doc_id in journaled_patch_docs:
+                to_process_docs.pop(doc_id, None)
+            async with pipeline_status_lock:
+                skip_message = (
+                    f"Skipping {len(journaled_patch_docs)} document(s) with an "
+                    "unfinished custom-chunk operation (retry the operation or "
+                    "run a scan to roll it back)"
+                )
+                logger.info(skip_message)
+                pipeline_status["latest_message"] = skip_message
+                pipeline_status["history_messages"].append(skip_message)
+
         inconsistent_docs = []
         failed_docs_to_preserve = []
         successful_deletions = 0
@@ -2240,10 +2273,14 @@ class _PipelineMixin:
                 logger.error(f"Unhandled error in process worker; aborting batch: {e}")
                 logger.error(traceback.format_exc())
                 async with ctx.pipeline_status_lock:
-                    ctx.pipeline_status["cancellation_requested"] = True
-                    ctx.pipeline_status["cancellation_reason"] = "internal_error"
-                    ctx.pipeline_status["cancellation_detail"] = (
-                        f"process worker unhandled error: {e}"
+                    ctx.pipeline_status.update(
+                        {
+                            "cancellation_requested": True,
+                            "cancellation_reason": "internal_error",
+                            "cancellation_detail": (
+                                f"process worker unhandled error: {e}"
+                            ),
+                        }
                     )
             finally:
                 ctx.q_process.task_done()
@@ -2310,18 +2347,22 @@ class _PipelineMixin:
                 async with ctx.pipeline_status_lock:
                     ctx.processed_count += 1
                     current_file_number = ctx.processed_count
-                    ctx.pipeline_status["cur_batch"] = ctx.processed_count
 
-                    log_message = (
+                    extraction_message = (
                         f"Extracting stage {current_file_number}/"
                         f"{ctx.total_files}: {file_path}"
                     )
-                    logger.info(log_message)
-                    ctx.pipeline_status["history_messages"].append(log_message)
-                    log_message = f"Processing d-id: {doc_id}"
-                    logger.info(log_message)
-                    ctx.pipeline_status["latest_message"] = log_message
-                    ctx.pipeline_status["history_messages"].append(log_message)
+                    logger.info(extraction_message)
+                    processing_message = f"Processing d-id: {doc_id}"
+                    logger.info(processing_message)
+                    ctx.pipeline_status.update(
+                        {
+                            "cur_batch": ctx.processed_count,
+                            "latest_message": processing_message,
+                        }
+                    )
+                    ctx.pipeline_status["history_messages"].append(extraction_message)
+                    ctx.pipeline_status["history_messages"].append(processing_message)
 
                     # Prevent memory growth: keep only latest 5000 messages
                     # when exceeding 10000.  Trim in place so Manager.list-
@@ -2816,6 +2857,22 @@ class _PipelineMixin:
                         ctx.pipeline_status, ctx.pipeline_status_lock
                     )
 
+                    # Flush ALL derived stores BEFORE the durable PROCESSED
+                    # write. doc_status backends persist immediately on
+                    # upsert, so writing PROCESSED first opens a crash window
+                    # where the status is durable but the graph/vector/chunk
+                    # data is not — a false PROCESSED that recovery can never
+                    # detect (issue #3400: status is the commit record).
+                    await self._insert_done()
+
+                    # A sibling document's flush error may have aborted the
+                    # batch while our flush ran; do not mark PROCESSED during
+                    # teardown — bail out so this document is FAILED and
+                    # retried on the next run.
+                    await self._raise_if_cancelled(
+                        ctx.pipeline_status, ctx.pipeline_status_lock
+                    )
+
                     process_end_time = int(time.time())
                     await self._upsert_doc_status_transition(
                         doc_id=doc_id,
@@ -2832,8 +2889,6 @@ class _PipelineMixin:
                             **extraction_meta,
                         },
                     )
-
-                    await self._insert_done()
 
                     async with ctx.pipeline_status_lock:
                         log_message = (
@@ -2856,12 +2911,15 @@ class _PipelineMixin:
                     # and root cause so it is distinguishable from a user cancel.
                     if isinstance(e, IndexFlushError):
                         async with ctx.pipeline_status_lock:
-                            ctx.pipeline_status["cancellation_requested"] = True
-                            ctx.pipeline_status["cancellation_reason"] = (
-                                "internal_error"
-                            )
-                            ctx.pipeline_status["cancellation_detail"] = (
-                                f"{e.storage_name}[{e.namespace}]: {e.__cause__}"
+                            ctx.pipeline_status.update(
+                                {
+                                    "cancellation_requested": True,
+                                    "cancellation_reason": "internal_error",
+                                    "cancellation_detail": (
+                                        f"{e.storage_name}[{e.namespace}]: "
+                                        f"{e.__cause__}"
+                                    ),
+                                }
                             )
                         logger.error(
                             f"Aborting pipeline batch due to storage flush error: {e}"

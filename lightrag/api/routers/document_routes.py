@@ -2190,6 +2190,22 @@ async def run_scanning_process(
         except PipelineNotInitializedError:
             pass
 
+        # Roll back failed/stale custom-chunk operations FIRST, while the
+        # classification phase still holds ``scanning_exclusive`` (issue
+        # #3400 Phase 4). Discovery is storage-driven — SDK operations may
+        # have no scan-visible input file — and a failed rollback keeps the
+        # journal/FAILED row for the next scan without aborting this one.
+        if pipeline_status is not None and pipeline_status_lock is not None:
+            try:
+                await rag.arollback_failed_custom_chunk_patches(
+                    pipeline_status=pipeline_status,
+                    pipeline_status_lock=pipeline_status_lock,
+                )
+            except Exception as rollback_error:
+                logger.error(
+                    f"Scan-time custom-chunk rollback failed: {rollback_error}"
+                )
+
         new_files = doc_manager.scan_directory_for_new_files()
         total_files = len(new_files)
         logger.info(f"Found {total_files} files to index.")
@@ -2487,8 +2503,7 @@ async def background_delete_documents(
 
                 start_msg = f"Deleting document {i}/{total_docs}: {doc_id}"
                 logger.info(start_msg)
-                pipeline_status["cur_batch"] = i
-                pipeline_status["latest_message"] = start_msg
+                pipeline_status.update({"cur_batch": i, "latest_message": start_msg})
                 pipeline_status["history_messages"].append(start_msg)
 
             file_path = "#"
@@ -2599,6 +2614,7 @@ async def background_delete_documents(
         # cancellation-resistant so a cancel here cannot wedge the slot or
         # clobber a later holder. Returns whether an indexing request is pending.
         def _delete_release(status):
+            completion_msg = f"Deletion completed: {len(successful_deletions)} successful, {len(failed_deletions)} failed"
             status.update(
                 {
                     "busy": False,
@@ -2606,10 +2622,9 @@ async def background_delete_documents(
                     "busy_owner": None,
                     "operation_record": None,
                     "cancellation_requested": False,
+                    "latest_message": completion_msg,
                 }
             )
-            completion_msg = f"Deletion completed: {len(successful_deletions)} successful, {len(failed_deletions)} failed"
-            status["latest_message"] = completion_msg
             status["history_messages"].append(completion_msg)
             return status.get("request_pending", False)
 
@@ -3596,16 +3611,16 @@ def create_document_routes(
             from lightrag.kg.shared_storage import with_reservation_lock
 
             def _clear_release(status):
+                completion_msg = "Document clearing process completed"
                 status.update(
                     {
                         "busy": False,
                         "destructive_busy": False,
                         "busy_owner": None,
                         "operation_record": None,
+                        "latest_message": completion_msg,
                     }
                 )
-                completion_msg = "Document clearing process completed"
-                status["latest_message"] = completion_msg
                 if "history_messages" in status:
                     status["history_messages"].append(completion_msg)
 
@@ -4495,10 +4510,14 @@ def create_document_routes(
                     )
 
                 # Set cancellation flag
-                pipeline_status["cancellation_requested"] = True
                 cancel_msg = "Pipeline cancellation requested by user"
                 logger.info(cancel_msg)
-                pipeline_status["latest_message"] = cancel_msg
+                pipeline_status.update(
+                    {
+                        "cancellation_requested": True,
+                        "latest_message": cancel_msg,
+                    }
+                )
                 pipeline_status["history_messages"].append(cancel_msg)
 
             return CancelPipelineResponse(
