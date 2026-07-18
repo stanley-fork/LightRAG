@@ -16,6 +16,7 @@ import logging
 import logging.config
 import sys
 import textwrap
+import uuid
 import uvicorn
 import pipmaster as pm
 from typing import Any
@@ -31,6 +32,7 @@ from lightrag.api.utils_api import (
     get_auth_status_dependency,
     display_splash_screen,
     check_env_file,
+    internal_server_error,
 )
 from .config import (
     global_args,
@@ -1379,6 +1381,26 @@ def create_app(args):
             # For other endpoints, return the default FastAPI validation error
             return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
+    # Last-resort handler for any exception that escapes a route without being
+    # converted to an HTTPException. It guarantees raw exception text never
+    # reaches the client (CWE-209): the full detail and traceback are logged
+    # server-side under a correlation id, and the response body carries only a
+    # generic message plus that id. HTTPException (including the sanitized 500s
+    # raised via internal_server_error) is still handled by FastAPI's own
+    # handler and is intentionally not intercepted here.
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(request: Request, exc: Exception):
+        error_id = uuid.uuid4().hex[:12]
+        logger.error(
+            f"Unhandled exception [error_id={error_id}] on "
+            f"{request.method} {request.url.path}",
+            exc_info=True,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Internal server error (error_id: {error_id})"},
+        )
+
     def get_cors_origins():
         """Get allowed origins from global_args.
 
@@ -1964,7 +1986,13 @@ def create_app(args):
     # Configure rerank function based on args.rerank_bindingparameter
     rerank_model_func = None
     if args.rerank_binding != "null":
-        from lightrag.rerank import cohere_rerank, jina_rerank, ali_rerank
+        from lightrag.rerank import (
+            cohere_rerank,
+            jina_rerank,
+            ali_rerank,
+            DEFAULT_RERANK_MAX_TOKENS_PER_DOC,
+            MIN_PRACTICAL_RERANK_MAX_TOKENS,
+        )
 
         # Map rerank binding to corresponding function
         rerank_functions = {
@@ -1995,6 +2023,39 @@ def create_app(args):
                 if default_base_url != inspect.Parameter.empty:
                     args.rerank_binding_host = default_base_url
 
+        # Cohere binding supports optional document chunking (useful for models with
+        # token limits like ColBERT). Parse and validate its config ONCE at startup so a
+        # misconfigured RERANK_MAX_TOKENS_PER_DOC fails fast here instead of surfacing on
+        # the first user query, and so the value is not re-parsed on every rerank call.
+        rerank_enable_chunking = False
+        rerank_max_tokens_per_doc = DEFAULT_RERANK_MAX_TOKENS_PER_DOC
+        if args.rerank_binding == "cohere":
+            rerank_enable_chunking = (
+                os.getenv("RERANK_ENABLE_CHUNKING", "false").lower() == "true"
+            )
+            raw_max_tokens = os.getenv(
+                "RERANK_MAX_TOKENS_PER_DOC", str(DEFAULT_RERANK_MAX_TOKENS_PER_DOC)
+            )
+            try:
+                rerank_max_tokens_per_doc = int(raw_max_tokens)
+            except ValueError as e:
+                raise ValueError(
+                    f"RERANK_MAX_TOKENS_PER_DOC must be an integer, got {raw_max_tokens!r}"
+                ) from e
+            if rerank_max_tokens_per_doc < 1:
+                raise ValueError(
+                    f"RERANK_MAX_TOKENS_PER_DOC must be >= 1, got {rerank_max_tokens_per_doc}"
+                )
+            if (
+                rerank_enable_chunking
+                and rerank_max_tokens_per_doc < MIN_PRACTICAL_RERANK_MAX_TOKENS
+            ):
+                logger.warning(
+                    f"RERANK_MAX_TOKENS_PER_DOC={rerank_max_tokens_per_doc} is below the "
+                    f"practical minimum ({MIN_PRACTICAL_RERANK_MAX_TOKENS}); chunking will "
+                    f"split each document into many tiny, low-signal chunks."
+                )
+
         async def server_rerank_func(
             query: str, documents: list, top_n: int = None, extra_body: dict = None
         ):
@@ -2009,15 +2070,10 @@ def create_app(args):
                 "base_url": args.rerank_binding_host,
             }
 
-            # Add Cohere-specific parameters if using cohere binding
+            # Add Cohere-specific parameters if using cohere binding (validated at startup)
             if args.rerank_binding == "cohere":
-                # Enable chunking if configured (useful for models with token limits like ColBERT)
-                kwargs["enable_chunking"] = (
-                    os.getenv("RERANK_ENABLE_CHUNKING", "false").lower() == "true"
-                )
-                kwargs["max_tokens_per_doc"] = int(
-                    os.getenv("RERANK_MAX_TOKENS_PER_DOC", "4096")
-                )
+                kwargs["enable_chunking"] = rerank_enable_chunking
+                kwargs["max_tokens_per_doc"] = rerank_max_tokens_per_doc
 
             return await selected_rerank_func(**kwargs, extra_body=extra_body)
 
@@ -2436,7 +2492,7 @@ def create_app(args):
             return status_data
         except Exception as e:
             logger.error(f"Error getting health status: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise internal_server_error(e)
 
     # Pre-render the runtime-config <script> once. The browser-visible URL
     # prefixes are NOT baked into the bundle anymore — index.html ships with
