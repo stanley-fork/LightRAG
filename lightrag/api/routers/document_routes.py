@@ -1026,7 +1026,6 @@ class PipelineStatusResponse(BaseModel):
         docs: Total number of documents to be indexed
         batchs: Number of batches for processing documents
         cur_batch: Current processing batch
-        request_pending: Flag for pending request for processing
         latest_message: Latest message from pipeline processing
         history_messages: List of history messages
         update_status: Status of update flags for all namespaces
@@ -1039,7 +1038,6 @@ class PipelineStatusResponse(BaseModel):
     docs: int = 0
     batchs: int = 0
     cur_batch: int = 0
-    request_pending: bool = False
     latest_message: str = ""
     history_messages: Optional[List[str]] = None
     update_status: Optional[dict] = None
@@ -1281,8 +1279,8 @@ async def _reserve_enqueue_slot(rag: LightRAG, token: str) -> bool:
     and a dead owner's token can later be reaped.
 
     Concurrent enqueues are permitted while the processing loop is
-    running — the loop is notified via ``request_pending`` and picks up
-    newly-enqueued docs after its current batch.  This includes the
+    running — the loop is notified via the ingress mailbox and picks up
+    newly-enqueued docs mid-batch or at the batch boundary.  This includes the
     scan task's processing phase: once classification is done, the
     scan transitions to driving the processing pipeline like any
     other enqueuer, and uploads can land alongside it.
@@ -1976,7 +1974,7 @@ async def pipeline_index_files(
     file_paths: List[Path],
     track_id: str = None,
     from_scan: bool = False,
-):
+) -> bool:
     """Index multiple files sequentially to avoid high CPU load
 
     Args:
@@ -1988,9 +1986,18 @@ async def pipeline_index_files(
             calls bypass the scanning guard inside
             ``apipeline_enqueue_documents`` (whose ``scanning`` flag the
             scan task itself owns).
+
+    Returns:
+        ``True`` iff ``apipeline_process_enqueue_documents`` was actually
+        invoked — i.e. at least one file enqueued.  Callers use this to know
+        whether the processing run (and its start-of-run mailbox peek) really
+        happened; when every file is rejected (duplicate, empty body,
+        extraction error, ...) nothing drives the queue and this returns
+        ``False`` so a sticky manual retry is not left waiting for an unrelated
+        trigger.
     """
     if not file_paths:
-        return
+        return False
     try:
         enqueued = False
 
@@ -2013,9 +2020,11 @@ async def pipeline_index_files(
         # Process the queue only if at least one file was successfully enqueued
         if enqueued:
             await rag.apipeline_process_enqueue_documents()
+        return enqueued
     except Exception as e:
         logger.error(f"Error indexing files: {str(e)}")
         logger.error(traceback.format_exc())
+        return False
 
 
 _STRATEGY_TO_PROCESS_OPTION: Dict[str, str] = {
@@ -2188,6 +2197,7 @@ async def run_scanning_process(
     doc_manager: DocumentManager,
     track_id: str = None,
     scanning_token: str | None = None,
+    manual_request_id: str | None = None,
 ):
     """Background task to scan and index documents
 
@@ -2195,6 +2205,16 @@ async def run_scanning_process(
         rag: LightRAG instance
         doc_manager: DocumentManager instance
         track_id: Optional tracking ID to pass to all scanned files
+        manual_request_id: The sticky manual retry request the scan endpoint
+            published for this scan (None on legacy/mocked paths). The driven
+            processing run consumes it from the ingress — the only path that
+            pulls FAILED documents back in. If classification fails before
+            any drive consumed it, the finally below drives the queue once so
+            the intent does not wait for an unrelated trigger; on ANY
+            cancellation the drive is skipped and the request simply stays
+            sticky for the next trigger (a shutdown must not start a full
+            processing run, and a cancellation's origin cannot be told apart
+            here).
     """
     # The scan endpoint set ``scanning=True`` AND
     # ``scanning_exclusive=True`` synchronously before scheduling this
@@ -2223,6 +2243,12 @@ async def run_scanning_process(
     # CancelledError only once, so a post-release ``await`` here would otherwise
     # run parse/LLM/index to completion and stall the shutdown.
     was_cancelled = False
+    # True once any drive branch below invoked the processing queue: the
+    # manual-intent fallback in the finally only fires when EVERY branch was
+    # skipped or classification failed — a drive that ran had its chance to
+    # consume the scan's sticky request (and a busy-refused drive leaves it
+    # for the running loop's quiescence peek).
+    queue_drive_attempted = False
     try:
         # Fetch INSIDE the release try: the scan endpoint already reserved
         # ``scanning``/``scanning_exclusive`` before scheduling us, so a
@@ -2412,14 +2438,19 @@ async def run_scanning_process(
             # least one new file is successfully enqueued, pipeline_index_files
             # internally invokes apipeline_process_enqueue_documents, which
             # selects work by doc_status state and so will also pick up any
-            # resume_files in the same run.
+            # resume_files in the same run.  Mark queue_drive_attempted only if
+            # a drive ACTUALLY ran: when every new file is rejected (duplicate,
+            # empty body, extraction error, ...) pipeline_index_files returns
+            # False, so the classification-failure fallback below still gets to
+            # drive this scan's sticky manual request instead of stranding it.
             if new_files:
-                await pipeline_index_files(
+                if await pipeline_index_files(
                     rag,
                     new_files,
                     track_id,
                     from_scan=True,
-                )
+                ):
+                    queue_drive_attempted = True
 
             # Resume targets must always trigger the pipeline explicitly:
             # pipeline_index_files only runs apipeline_process_enqueue_documents
@@ -2430,6 +2461,7 @@ async def run_scanning_process(
             # enqueue, the inner call already drained the queue and this is a
             # cheap no-op that returns "No documents to process".
             if resume_files:
+                queue_drive_attempted = True
                 await rag.apipeline_process_enqueue_documents()
 
             total_active = len(new_files) + len(resume_files)
@@ -2461,6 +2493,7 @@ async def run_scanning_process(
             logger.info(
                 "No upload file found, check if there are any documents in the queue..."
             )
+            queue_drive_attempted = True
             await rag.apipeline_process_enqueue_documents()
 
     except asyncio.CancelledError:
@@ -2509,9 +2542,33 @@ async def run_scanning_process(
             and pipeline_status is not None
             and pipeline_status_lock is not None
         ):
-            if await has_scan_deferred_processing(
+            drive_needed = await has_scan_deferred_processing(
                 pipeline_status, pipeline_status_lock
+            )
+            if (
+                not drive_needed
+                and manual_request_id is not None
+                and not queue_drive_attempted
             ):
+                # Classification-failure fallback: if this scan's sticky
+                # manual request was never consumed (every drive branch above
+                # was skipped or failed), drive the queue once storage-only —
+                # the run's start peek picks the request up. Read-only check;
+                # racing a concurrent consumer only makes the drive a cheap
+                # no-op.
+                try:
+                    from lightrag.kg.shared_storage import get_pipeline_ingress
+
+                    ingress = await get_pipeline_ingress(rag.workspace)
+                    drive_needed = any(
+                        message.request_id == manual_request_id
+                        for message in ingress.snapshot_manual_retries()
+                    )
+                except Exception as ingress_error:
+                    logger.error(
+                        f"Post-scan manual-intent check failed: {ingress_error}"
+                    )
+            if drive_needed:
                 try:
                     await rag.apipeline_process_enqueue_documents()
                 except Exception as drive_error:
@@ -2532,6 +2589,7 @@ async def background_delete_documents(
     from lightrag.kg.shared_storage import (
         get_namespace_data,
         get_namespace_lock,
+        get_pipeline_ingress,
         release_owned_reservation,
     )
 
@@ -2708,6 +2766,26 @@ async def background_delete_documents(
         # Final summary + release the destructive slot, owner-checked +
         # cancellation-resistant so a cancel here cannot wedge the slot or
         # clobber a later holder. Returns whether an indexing request is pending.
+
+        # Resolve the ingress handle BEFORE the release: the pending-work
+        # probe runs inside the owner-checked critical section below, and a
+        # Manager RPC handle must never be resolved lazily while the status
+        # lock is held.  A resolution failure fails TOWARD driving — a
+        # spurious drive is a busy-gated cheap no-op, while skipping it would
+        # silently defer work that arrived during the delete to the next
+        # unrelated trigger.  This await precedes the cancellation-resistant
+        # release — safe only because get_pipeline_ingress is suspension-free
+        # by contract (see its docstring), so a pending re-cancellation
+        # cannot be delivered here and skip the release.
+        try:
+            delete_exit_ingress = await get_pipeline_ingress(rag.workspace)
+        except Exception as ingress_error:
+            delete_exit_ingress = None
+            logger.warning(
+                "batch-delete exit: pipeline ingress unavailable; failing "
+                f"toward the post-delete queue drive: {ingress_error}"
+            )
+
         def _delete_release(status):
             completion_msg = f"Deletion completed: {len(successful_deletions)} successful, {len(failed_deletions)} failed"
             status.update(
@@ -2721,14 +2799,29 @@ async def background_delete_documents(
                 }
             )
             status["history_messages"].append(completion_msg)
-            return status.get("request_pending", False)
+            # Probe the mailbox INSIDE the same critical section that releases
+            # the slot: a processing request refused while we held busy armed
+            # the auto-rescan flag under this very lock, so it is either seen
+            # here (drive below) or was armed after busy=False — in which case
+            # the arming caller's own process call takes the slot itself.
+            if delete_exit_ingress is None:
+                return True  # fail toward driving
+            try:
+                return bool(delete_exit_ingress.has_work())
+            except Exception as probe_error:
+                logger.warning(
+                    "batch-delete exit: ingress has_work probe failed; "
+                    f"failing toward the post-delete queue drive: {probe_error}"
+                )
+                return True
 
         # Release the destructive slot with the fetch, lock and owner-checked
         # write ALL inside run_to_completion (release_owned_reservation), so a
         # cancellation delivered during the release — including a re-cancellation
         # of the namespace fetch after the initial fetch was already cancelled —
         # is retried rather than leaving busy/destructive_busy stuck. Returns the
-        # pending flag (or None when uninitialised / a later holder owns it).
+        # pending-work probe result (or None when uninitialised / a later holder
+        # owns it).
         has_pending_request = await release_owned_reservation(
             rag.workspace,
             owner_key="busy_owner",
@@ -2792,11 +2885,14 @@ def create_document_routes(
             ScanResponse: A response object containing the scanning status and track_id
         """
         from lightrag.exceptions import PipelineNotInitializedError
+        from lightrag.kg.pipeline_ingress import PipelineIngressMessage
         from lightrag.kg.shared_storage import (
             PipelineReservationConflict,
             acquire_reservation,
             get_namespace_data,
             get_namespace_lock,
+            get_pipeline_ingress,
+            start_committed_background_task,
             start_reserved_background_task,
         )
 
@@ -2804,12 +2900,20 @@ def create_document_routes(
         track_id = generate_track_id("scan")
         # Owner token for the scanning reservation, generated before any await.
         scanning_token = uuid4().hex
+        # The scan's manual retry intent: published ONLY after the scan
+        # reservation is granted (a refused scan must have zero side effects),
+        # inside the committed-startup child. The driven processing run peeks
+        # it from the ingress — that is the only path pulling FAILED docs
+        # (resume/retry classification) back into the pipeline.
+        manual_request_id = uuid4().hex
+        # Endpoint-visible mirror of the commit state: set synchronously with
+        # the publish, so the finally below knows ownership transferred even
+        # when the caller was cancelled right after the commit.
+        takeover = {"committed": False}
 
-        async def _scan_work(started):
-            # started.set() first (no await before it) so the endpoint's
-            # start-barrier confirms takeover before returning; a body-send
-            # cancellation therefore cannot strand the reservation. Its release
-            # (owner-checked) lives in run_scanning_process's own finally.
+        async def _legacy_scan_work(started):
+            # Mocked-rig path (no pipeline_status): started.set() first so the
+            # start-barrier confirms takeover; no reservation, no ingress.
             started.set()
             await run_scanning_process(rag, doc_manager, track_id, scanning_token)
 
@@ -2827,7 +2931,7 @@ def create_document_routes(
             # scanning flag has nowhere to live so it is effectively skipped.
             # Still start it as a managed task so shutdown can drain it.
             await start_reserved_background_task(
-                managed_tasks, work=_scan_work, backstop_release=_scan_backstop
+                managed_tasks, work=_legacy_scan_work, backstop_release=_scan_backstop
             )
             return ScanResponse(
                 status="scanning_started",
@@ -2906,13 +3010,49 @@ def create_document_routes(
                     track_id=track_id,
                 )
 
-            # Hand the reservation to a managed background task. The start
-            # barrier guarantees the child took over (started.set) before we
-            # return, so a cancellation while sending the response body cannot
-            # strand ``scanning``. run_scanning_process clears both flags in its
-            # finally, owner-checked by scanning_token.
-            await start_reserved_background_task(
-                managed_tasks, work=_scan_work, backstop_release=_scan_backstop
+            # Hand the reservation to a managed background task via the
+            # two-state committed startup: the child publishes the scan's
+            # sticky manual retry intent (commit) and only then runs the scan.
+            # A cancellation BEFORE the commit cancels the child and releases
+            # the reservation with zero side effects; AFTER the commit the
+            # child is never cancelled — it owns both the reservation (released
+            # in run_scanning_process's finally, owner-checked by
+            # scanning_token) and the published intent.
+            ingress = await get_pipeline_ingress(rag.workspace)
+
+            async def _scan_commit(state):
+                # Fence already passed — this endpoint holds the scanning
+                # reservation. The commit only publishes the intent; the
+                # committed marker is set synchronously with the publish so a
+                # cancellation landing in the lock release already counts as
+                # committed on both sides.
+                async with pipeline_status_lock:
+                    ingress.request_manual_retry(
+                        manual_request_id,
+                        PipelineIngressMessage(
+                            kind="rescan",
+                            retry_failed=True,
+                            request_id=manual_request_id,
+                        ),
+                    )
+                    state["committed"] = True
+                    takeover["committed"] = True
+                return None
+
+            async def _scan_run():
+                await run_scanning_process(
+                    rag,
+                    doc_manager,
+                    track_id,
+                    scanning_token,
+                    manual_request_id=manual_request_id,
+                )
+
+            await start_committed_background_task(
+                managed_tasks,
+                commit=_scan_commit,
+                work=_scan_run,
+                backstop_release=_scan_backstop,
             )
             # Ownership of the slot transferred to the bg task — it releases in
             # its finally. The endpoint's finally must NOT release it again.
@@ -2927,8 +3067,10 @@ def create_document_routes(
             # arrived before the managed task took over (e.g. at the
             # pipeline_status_lock __aexit__ await, before hand-off). Owner-
             # checked + idempotent, so a no-op once the task owns it (or the
-            # start helper's own backstop already released it).
-            if reserved and not handed_off:
+            # start helper's own backstop already released it). A commit that
+            # already happened (takeover mirror) means the child owns the slot
+            # even if the caller was cancelled before ``handed_off`` was set.
+            if reserved and not handed_off and not takeover["committed"]:
                 await _release_scanning_reservation(rag, scanning_token)
 
     @router.post(
@@ -2995,7 +3137,7 @@ def create_document_routes(
           processing phase (``scanning=True`` with
           ``scanning_exclusive=False``), do NOT block uploads — uploads
           are accepted concurrently and the running pipeline picks them
-          up via its ``request_pending`` mechanism.
+          up via the ingress mailbox.
 
         Args:
             managed_tasks: injected managed background-task set
@@ -3025,8 +3167,8 @@ def create_document_routes(
             # processing (``busy=True``) and a scan in its processing
             # phase (``scanning=True`` with
             # ``scanning_exclusive=False``) are permitted: the running
-            # loop's ``request_pending`` mechanism picks up our doc
-            # after the current batch.
+            # loop picks up our doc via the ingress mailbox, mid-batch
+            # or at the batch boundary.
             await _reserve_enqueue_slot(rag, enqueue_token)
 
             # Sanitize filename to prevent Path Traversal attacks
@@ -3150,10 +3292,10 @@ def create_document_routes(
             # ``pipeline_index_file`` does both: it calls
             # ``pipeline_enqueue_file`` (writes doc_status / full_docs) and
             # then ``apipeline_process_enqueue_documents``.  The latter is
-            # safe to invoke even when the loop is already busy — it
-            # collapses to a ``request_pending=True`` nudge and returns,
+            # safe to invoke even when the loop is already busy — its
+            # refused reservation arms the auto-rescan flag and returns,
             # so concurrent uploads/inserts cooperate via the running
-            # loop's request_pending mechanism.
+            # loop's quiescence decision.
             async def _indexing_work(started):
                 # started.set() first (no await before it) so the endpoint's
                 # start-barrier confirms takeover before returning; a body-send
@@ -3217,7 +3359,7 @@ def create_document_routes(
           (clear / per-doc delete is in flight) is set.  ``busy=True``
           from the processing loop, and a scan in its processing phase,
           do NOT block — the running pipeline picks up the new doc via
-          ``request_pending``.
+          the ingress mailbox.
 
         Args:
             request (InsertTextRequest): The request body containing the text to be inserted.
@@ -3344,7 +3486,7 @@ def create_document_routes(
           (clear / per-doc delete is in flight) is set.  ``busy=True``
           from the processing loop, and a scan in its processing phase,
           do NOT block — the running pipeline picks up the new docs via
-          ``request_pending``.
+          the ingress mailbox.
 
         Args:
             request (InsertTextsRequest): The request body containing the list of texts.
@@ -3508,6 +3650,7 @@ def create_document_routes(
         from lightrag.kg.shared_storage import (
             get_namespace_data,
             get_namespace_lock,
+            get_pipeline_ingress,
         )
 
         # Get pipeline status and lock
@@ -3551,7 +3694,6 @@ def create_document_routes(
                         "docs": 0,
                         "batchs": 0,
                         "cur_batch": 0,
-                        "request_pending": False,  # Clear any previous request
                         "latest_message": "Starting document clearing process",
                     }
                 )
@@ -3559,6 +3701,32 @@ def create_document_routes(
                 del pipeline_status["history_messages"][:]
                 pipeline_status["history_messages"].append(
                     "Starting document clearing process"
+                )
+
+            # We own busy+destructive: every document the mailbox refers to is
+            # about to be dropped, so clear the ingress alongside the
+            # job-status reset above — un-ACKed manual retry requests
+            # are retired as CANCELLED_BY_CLEAR (a delayed replay of the same
+            # request id is refused), and the document/auto channels are
+            # emptied.  ``destructive_busy`` already refuses new enqueues, so
+            # nothing repopulates the mailbox during the drop.  Clearing
+            # BEFORE the drops means a later partial drop failure has already
+            # retired manual requests for still-live FAILED docs — acceptable
+            # under the destructive intent and surfaced via partial_success.
+            # A failure here only degrades: residual stale messages are
+            # compacted by the next run's consumption idempotence, and a
+            # surviving sticky request strict-scans the emptied doc_status and
+            # ACKs harmlessly.
+            try:
+                ingress = await get_pipeline_ingress(rag.workspace)
+                ingress.clear()
+            except Exception as ingress_clear_error:
+                logger.warning(
+                    "/documents/clear: failed to clear the pipeline ingress "
+                    "mailbox; safe to continue — residual document messages "
+                    "are compacted by the next run and a surviving manual "
+                    "retry request ACKs harmlessly against the emptied "
+                    f"doc_status: {ingress_clear_error}"
                 )
 
             # Use drop method to clear all data
@@ -3744,7 +3912,6 @@ def create_document_routes(
                 - docs (int): Total number of documents to be indexed
                 - batchs (int): Number of batches for processing documents
                 - cur_batch (int): Current processing batch
-                - request_pending (bool): Flag for pending request for processing
                 - latest_message (str): Latest message from pipeline processing
                 - history_messages (List[str], optional): List of history messages (limited to latest 1000 entries,
                   with truncation message if more than 1000 messages exist)
@@ -4432,78 +4599,131 @@ def create_document_routes(
         managed_tasks: set = Depends(get_managed_background_tasks),
     ):
         """
-        Reprocess failed and pending documents.
+        Reprocess existing failed, pending, or interrupted document records
+        without scanning the input directory for new files.
 
-        This endpoint triggers the document processing pipeline which automatically
-        picks up and reprocesses documents in the following statuses:
-        - FAILED: Documents that failed during previous processing attempts
-        - PENDING: Documents waiting to be processed
-        - PROCESSING: Documents with abnormally terminated processing (e.g., server crashes)
+        Pure storage-driven recovery: this endpoint publishes a sticky manual
+        retry request into the workspace ingress and drives the processing
+        pipeline. FAILED documents re-enter the pipeline ONLY through such an
+        explicit request — each request grants at most ONE retry attempt per
+        FAILED document; a document that fails again stays FAILED until the
+        next explicit request. PENDING and interrupted documents
+        (PROCESSING/PARSING/ANALYZING left by a crash) are picked up as well.
 
-        This is useful for recovering from server crashes, network errors, LLM service
-        outages, or other temporary failures that caused document processing to fail.
+        This endpoint does NOT discover new files, archive anything, or run
+        scan classification; a FAILED document with an unfinished
+        custom-chunk journal is skipped and still requires ``/documents/scan``
+        to roll back.
 
-        The processing happens in the background and can be monitored by checking the
-        pipeline status. The reprocessed documents retain their original track_id from
-        initial upload, so use their original track_id to monitor progress.
+        If the pipeline is busy, the request is NOT lost: it stays queued in
+        the workspace ingress and executes when the current run reaches its
+        next quiescence point. The processing happens in the background and
+        can be monitored via the pipeline status; reprocessed documents
+        retain their original track_id from initial upload.
 
         Returns:
             ReprocessResponse: Response with status and message.
-                track_id is always empty string because reprocessed documents retain
-                their original track_id from initial upload.
+                track_id is always empty string because reprocessed documents
+                retain their original track_id from initial upload.
 
         Raises:
-            HTTPException: If an error occurs while initiating reprocessing (500).
+            HTTPException: 503 when the workspace is fenced (recovery
+                required, or a clear/delete is dropping storages); 500 on
+                unexpected errors while initiating reprocessing.
         """
         from lightrag.exceptions import PipelineNotInitializedError
         from lightrag.kg.shared_storage import (
-            check_pipeline_status_mutation,
+            ManualIntentRefused,
+            commit_manual_retry_request,
             get_namespace_data,
             get_namespace_lock,
+            get_pipeline_ingress,
+            start_committed_background_task,
             start_reserved_background_task,
         )
 
-        # Fail-closed BEFORE scheduling: the processing loop refuses on a fenced
-        # workspace, so a scheduled task would report "reprocessing_started" while
-        # nothing is ever queued or processed. Reconcile + refuse with 503 here so
-        # the client sees the fence instead of a false success. (Raised before the
-        # try/except below, whose ``except Exception`` would otherwise remap it.)
-        try:
-            _ps = await get_namespace_data("pipeline_status", workspace=rag.workspace)
-        except PipelineNotInitializedError:
-            _ps = None
-        if _ps is not None:
-            _ps_lock = get_namespace_lock("pipeline_status", workspace=rag.workspace)
-            result = await check_pipeline_status_mutation(_ps, _ps_lock)
-            if not result.acquired:
-                raise HTTPException(status_code=503, detail=result.message)
+        request_id = uuid4().hex
 
-        # Reprocess holds NO reservation of its own — apipeline_process_enqueue_documents
-        # acquires (and releases) the busy slot itself. We only need the task to
-        # be MANAGED so the lifespan can drain it on shutdown; the backstop is a
-        # no-op because there is nothing to release if the child never takes over.
-        async def _reprocess_work(started):
-            started.set()
+        try:
+            pipeline_status = await get_namespace_data(
+                "pipeline_status", workspace=rag.workspace
+            )
+        except PipelineNotInitializedError:
+            pipeline_status = None
+
+        if pipeline_status is None:
+            # Workspace pipeline_status not bootstrapped (mocked test rigs):
+            # there is no fence and no ingress to publish into — fall back to
+            # a plain managed drive.
+            async def _legacy_work(started):
+                started.set()
+                await rag.apipeline_process_enqueue_documents()
+
+            async def _noop_backstop():
+                return None
+
+            try:
+                await start_reserved_background_task(
+                    managed_tasks, work=_legacy_work, backstop_release=_noop_backstop
+                )
+                return ReprocessResponse(
+                    status="reprocessing_started",
+                    message="Reprocessing of failed documents has been initiated "
+                    "in background. Documents retain their original track_id.",
+                )
+            except Exception as e:
+                logger.error(f"Error initiating reprocessing: {str(e)}")
+                logger.error(traceback.format_exc())
+                raise internal_server_error(e)
+
+        pipeline_status_lock = get_namespace_lock(
+            "pipeline_status", workspace=rag.workspace
+        )
+        # Resolve the ingress BEFORE any critical section (never lazily while
+        # the pipeline status lock is held inside the commit).
+        ingress = await get_pipeline_ingress(rag.workspace)
+
+        # Two-state startup: the fence recheck and the sticky publish happen
+        # in ONE pipeline_status_lock critical section inside the child
+        # (commit), so a destructive clear cannot slip its reservation in
+        # between; once committed, an endpoint cancellation no longer cancels
+        # the child — the published intent has an owner driving it. Reprocess
+        # holds no reservation of its own (apipeline_process_enqueue_documents
+        # acquires/releases busy itself), so the backstop is a no-op.
+        async def _commit(state):
+            return await commit_manual_retry_request(
+                pipeline_status,
+                pipeline_status_lock,
+                ingress,
+                request_id,
+                state,
+            )
+
+        async def _work():
             await rag.apipeline_process_enqueue_documents()
 
-        async def _reprocess_backstop():
+        async def _noop_backstop():
             return None
 
         try:
-            # Start the reprocessing in a managed background task.
-            # Note: Reprocessed documents retain their original track_id from initial upload
-            await start_reserved_background_task(
+            await start_committed_background_task(
                 managed_tasks,
-                work=_reprocess_work,
-                backstop_release=_reprocess_backstop,
+                commit=_commit,
+                work=_work,
+                backstop_release=_noop_backstop,
             )
-            logger.info("Reprocessing of failed documents initiated")
-
+            logger.info(
+                f"Reprocessing of failed documents initiated (request {request_id})"
+            )
             return ReprocessResponse(
                 status="reprocessing_started",
-                message="Reprocessing of failed documents has been initiated in background. Documents retain their original track_id.",
+                message="Reprocessing of failed documents has been initiated in "
+                "background (one retry attempt per failed document). If the "
+                "pipeline is busy the request executes at its next quiescence "
+                "point. Documents retain their original track_id.",
             )
-
+        except ManualIntentRefused as refusal:
+            raise HTTPException(status_code=503, detail=str(refusal))
         except Exception as e:
             logger.error(f"Error initiating reprocessing of failed documents: {str(e)}")
             logger.error(traceback.format_exc())

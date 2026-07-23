@@ -1049,8 +1049,8 @@ async def test_upload_succeeds_concurrent_with_pipeline_busy(tmp_path, monkeypat
     """Under the new contract, ``busy=True`` no longer blocks uploads.
     The upload reserves a pending-enqueue slot, schedules its bg task,
     and returns success; the bg task's enqueue is permitted while the
-    pipeline is busy and the running loop's request_pending mechanism
-    will pick up the new doc after its current batch.
+    pipeline is busy and the running loop picks up the new doc via the
+    ingress mailbox.
     """
     import importlib
 
@@ -1154,8 +1154,8 @@ async def test_upload_succeeds_during_scan_processing_phase(tmp_path, monkeypatc
     """User-reported scenario: while pipeline is doing scan-driven
     processing (``scanning=True`` but ``scanning_exclusive=False``),
     new uploads must be accepted.  Scan's processing phase is
-    behaviourally identical to busy=True — uploads coexist via
-    request_pending.
+    behaviourally identical to busy=True — uploads coexist via the
+    ingress mailbox.
     """
     import importlib
 
@@ -1240,6 +1240,10 @@ async def test_scan_endpoint_returns_skipped_when_pipeline_busy(tmp_path):
     assert len(managed) == 0
     # And ``scanning`` is left unchanged at False (we didn't acquire it).
     assert pipeline_status.get("scanning") is False
+    # Zero side effects: a refused scan publishes NO manual retry intent —
+    # the sticky request is committed only AFTER the reservation is granted.
+    ingress = await shared_storage.get_pipeline_ingress(rag.workspace)
+    assert ingress.snapshot_manual_retries() == []
 
 
 async def test_scan_endpoint_returns_skipped_when_already_scanning(tmp_path):
@@ -1409,8 +1413,8 @@ async def test_release_enqueue_slot_decrements_per_call(tmp_path):
     """Two-reservation cohort: each release is a pure decrement.  Drain
     coordination is no longer needed because the busy guard on enqueue
     has been removed — concurrent enqueues are permitted while the
-    pipeline is busy and the running loop's request_pending mechanism
-    drains them.
+    pipeline is busy and the running loop drains them via the ingress
+    mailbox.
     """
     import importlib
 
@@ -1436,7 +1440,7 @@ async def test_release_enqueue_slot_decrements_per_call(tmp_path):
 
     # Each release removes its own token; count mirrors the set size. No drain
     # coordination required — each bg task triggers process_enqueue independently
-    # and the running loop's request_pending mechanism collapses duplicates.
+    # and the running loop's quiescence decision collapses duplicates.
     await _document_routes._release_enqueue_slot(rag, "enq-a")
     assert pipeline_status["pending_enqueues"] == 1
 
@@ -1507,8 +1511,9 @@ async def test_scan_endpoint_releases_reservation_on_cancellation_before_handoff
 ):
     """Regression (#3408): a cancellation delivered after the scan endpoint
     reserves ``scanning``/``scanning_exclusive`` but before the managed task
-    takes over (e.g. the request cancelled while start_reserved_background_task
-    awaits the start barrier) must not leak the reservation. The endpoint's
+    commits (pre-commit cancellation of start_committed_background_task) must
+    not leak the reservation — and must leave NO sticky manual retry request
+    behind (a refused/cancelled scan has zero side effects). The endpoint's
     finally releases the owner token so both flags return to False.
     """
     import asyncio
@@ -1531,12 +1536,12 @@ async def test_scan_endpoint_releases_reservation_on_cancellation_before_handoff
 
     async def _cancel_before_takeover(*args, **kwargs):
         # Simulate a cancellation delivered after scanning was reserved but
-        # before the managed task took over (request cancelled at the start
+        # before the managed task committed (request cancelled at the start
         # barrier). The endpoint's finally must still release the slot.
         raise asyncio.CancelledError()
 
     monkeypatch.setattr(
-        shared_storage, "start_reserved_background_task", _cancel_before_takeover
+        shared_storage, "start_committed_background_task", _cancel_before_takeover
     )
 
     router = create_document_routes(rag, doc_manager)
@@ -1554,6 +1559,9 @@ async def test_scan_endpoint_releases_reservation_on_cancellation_before_handoff
     assert pipeline_status.get("scanning") is False
     assert pipeline_status.get("scanning_exclusive") is False
     assert pipeline_status.get("scanning_owner") is None
+    # Pre-commit teardown published nothing: the mailbox has no manual entry.
+    ingress = await shared_storage.get_pipeline_ingress(rag.workspace)
+    assert ingress.snapshot_manual_retries() == []
 
 
 async def test_clear_endpoint_releases_destructive_busy_on_cancellation_during_setup(
@@ -1779,6 +1787,145 @@ async def test_delete_task_releases_when_cancelled_before_release_try(
     assert pipeline_status.get("busy") is False
     assert pipeline_status.get("destructive_busy") is False
     assert pipeline_status.get("busy_owner") is None
+
+
+async def test_delete_release_drives_processing_on_mailbox_work(tmp_path):
+    """The post-delete queue drive keys off the ingress ``has_work`` probe
+    inside the owner-checked release: work that landed in the mailbox while
+    the delete held the destructive slot (e.g. a busy-refused process request
+    arming auto-rescan) triggers exactly one drive; an empty mailbox releases
+    without driving."""
+    import importlib
+
+    workspace = f"delete-drive-{uuid4().hex}"
+    destructive_token = uuid4().hex
+
+    class _Rag:
+        pass
+
+    rag = _Rag()
+    rag.workspace = workspace
+    doc_manager = DocumentManager(str(tmp_path))
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=workspace
+    )
+    ingress = await shared_storage.get_pipeline_ingress(workspace)
+
+    drives = {"n": 0}
+
+    async def _process():
+        drives["n"] += 1
+
+    rag.apipeline_process_enqueue_documents = _process
+
+    async def _adelete_and_signal(doc_id, delete_llm_cache=False):
+        # A busy-refused process request lands while we hold the slot.
+        ingress.request_auto_rescan()
+        return SimpleNamespace(status="success", file_path="-", message="ok")
+
+    rag.adelete_by_doc_id = _adelete_and_signal
+
+    pipeline_status.update(
+        {"busy": True, "destructive_busy": True, "busy_owner": destructive_token}
+    )
+    await _document_routes.background_delete_documents(
+        rag, doc_manager, ["doc-1"], token=destructive_token
+    )
+    assert drives["n"] == 1  # mailbox work → exactly one drive
+    assert pipeline_status.get("busy") is False
+    assert pipeline_status.get("destructive_busy") is False
+
+    # Empty mailbox → release without driving.
+    ingress.consume_auto_rescan()
+
+    async def _adelete_quiet(doc_id, delete_llm_cache=False):
+        return SimpleNamespace(status="success", file_path="-", message="ok")
+
+    rag.adelete_by_doc_id = _adelete_quiet
+    pipeline_status.update(
+        {"busy": True, "destructive_busy": True, "busy_owner": destructive_token}
+    )
+    await _document_routes.background_delete_documents(
+        rag, doc_manager, ["doc-2"], token=destructive_token
+    )
+    assert drives["n"] == 1  # unchanged: nothing pending, no spurious drive
+    assert pipeline_status.get("busy") is False
+
+
+async def test_delete_release_fails_toward_drive_on_ingress_failures(
+    tmp_path, monkeypatch
+):
+    """Both delete-exit failure arms fail TOWARD the post-delete drive: an
+    ingress resolve failure and a ``has_work`` probe failure each still
+    release the destructive slot and fire exactly one busy-gated drive —
+    never a silent defer of work that arrived during the delete, never a
+    wedged slot."""
+    import importlib
+
+    workspace = f"delete-drive-fail-{uuid4().hex}"
+    destructive_token = uuid4().hex
+
+    class _Rag:
+        pass
+
+    rag = _Rag()
+    rag.workspace = workspace
+    doc_manager = DocumentManager(str(tmp_path))
+
+    shared_storage = importlib.import_module("lightrag.kg.shared_storage")
+    await shared_storage.initialize_pipeline_status(workspace=workspace)
+    pipeline_status = await shared_storage.get_namespace_data(
+        "pipeline_status", workspace=workspace
+    )
+
+    drives = {"n": 0}
+
+    async def _process():
+        drives["n"] += 1
+
+    rag.apipeline_process_enqueue_documents = _process
+
+    async def _adelete(doc_id, delete_llm_cache=False):
+        return SimpleNamespace(status="success", file_path="-", message="ok")
+
+    rag.adelete_by_doc_id = _adelete
+
+    # Arm 1: the resolve itself fails → delete_exit_ingress=None → drive.
+    async def _broken_resolve(workspace=None):
+        raise RuntimeError("manager connection lost")
+
+    monkeypatch.setattr(shared_storage, "get_pipeline_ingress", _broken_resolve)
+    pipeline_status.update(
+        {"busy": True, "destructive_busy": True, "busy_owner": destructive_token}
+    )
+    await _document_routes.background_delete_documents(
+        rag, doc_manager, ["doc-1"], token=destructive_token
+    )
+    assert drives["n"] == 1  # exactly one drive, no loop
+    assert pipeline_status.get("busy") is False  # release still ran
+    assert pipeline_status.get("destructive_busy") is False
+
+    # Arm 2: the resolve succeeds but the in-lock has_work probe fails.
+    class _ProbeBroken:
+        def has_work(self):
+            raise RuntimeError("probe transport down")
+
+    async def _resolve_probe_broken(workspace=None):
+        return _ProbeBroken()
+
+    monkeypatch.setattr(shared_storage, "get_pipeline_ingress", _resolve_probe_broken)
+    pipeline_status.update(
+        {"busy": True, "destructive_busy": True, "busy_owner": destructive_token}
+    )
+    await _document_routes.background_delete_documents(
+        rag, doc_manager, ["doc-2"], token=destructive_token
+    )
+    assert drives["n"] == 2  # exactly one more drive
+    assert pipeline_status.get("busy") is False
+    assert pipeline_status.get("destructive_busy") is False
 
 
 async def test_release_destructive_helper_survives_fetch_cancellation(

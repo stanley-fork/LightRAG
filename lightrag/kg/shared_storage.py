@@ -25,6 +25,13 @@ from lightrag.constants import (
     DEFAULT_QUEUE_STATS_STALE_TTL,
 )
 from lightrag.exceptions import PipelineNotInitializedError
+from lightrag.kg.pipeline_ingress import (
+    AsyncioPipelineIngress,
+    ManagerPipelineIngress,
+    PipelineIngressHub,
+    PipelineIngressMessage,
+    _PipelineIngressHubProxy,
+)
 
 DEBUG_LOCKS = False
 
@@ -136,6 +143,24 @@ _queue_stats_ns_cache: Optional[Dict[str, Any]] = None
 # safely skip the internal lock and the __contains__/__getitem__ RPCs. Reset by
 # initialize_share_data()/finalize_share_data() to preserve workspace isolation.
 _namespace_data_cache: Optional[Dict[str, Any]] = None
+
+# Workspace pipeline ingress registry (see lightrag.kg.pipeline_ingress).
+# Deliberately OUTSIDE pipeline_status: the status dict is serialized into API
+# responses, an ingress object must never be. Two layers:
+#   * _pipeline_ingress_local — per-process cache, final namespace -> ingress
+#     (an AsyncioPipelineIngress single-process, a ManagerPipelineIngress view
+#     multiprocess).
+#   * _pipeline_ingress_hub — multiprocess only: the ONE hub proxy (created
+#     pre-fork like _keyed_holder_table; the server-side hub owns every
+#     workspace mailbox keyed by namespace string). Resolution is a plain
+#     namespace binding — no client-held locks, no per-workspace proxies, so
+#     a SIGKILLed client can neither strand creation nor split-brain a
+#     workspace.
+# Ownership: a mailbox belongs to the workspace, not to any LightRAG instance —
+# LightRAG.finalize_storages() must NOT touch it; only finalize_share_data(),
+# an explicit workspace teardown, or test cleanup may drop it.
+_pipeline_ingress_local: Optional[Dict[str, Any]] = None
+_pipeline_ingress_hub: Optional[Any] = None
 
 # Rate limiting for acquire-failure warnings (fail-closed path).
 _ACQUIRE_FAILURE_LOG_INTERVAL = 30.0
@@ -769,6 +794,11 @@ class _LightRAGManager(SyncManager):
 # spawn start methods.
 _LightRAGManager.register(
     "KeyedHolderTable", KeyedHolderTable, proxytype=_HolderTableProxy
+)
+_LightRAGManager.register(
+    "PipelineIngressHub",
+    PipelineIngressHub,
+    proxytype=_PipelineIngressHubProxy,
 )
 
 
@@ -1457,7 +1487,9 @@ def initialize_share_data(
         _global_concurrency_limits, \
         _lease_ns_cache, \
         _queue_stats_ns_cache, \
-        _namespace_data_cache
+        _namespace_data_cache, \
+        _pipeline_ingress_local, \
+        _pipeline_ingress_hub
 
     # Check if already initialized
     if _initialized:
@@ -1479,6 +1511,7 @@ def initialize_share_data(
     _lease_ns_cache = None
     _queue_stats_ns_cache = None
     _namespace_data_cache = {}
+    _pipeline_ingress_local = {}
     if _global_concurrency_limits:
         direct_log(
             f"Process {os.getpid()} Global concurrency limits: {_global_concurrency_limits}",
@@ -1498,6 +1531,11 @@ def initialize_share_data(
         _shared_dicts = _manager.dict()
         _init_flags = _manager.dict()
         _update_flags = _manager.dict()
+        # Server-side hub owning every workspace's ingress mailbox (same
+        # pre-fork topology as _keyed_holder_table): workers inherit this one
+        # proxy and bind namespaces to it — no per-workspace proxy creation,
+        # no client-held creation lock.
+        _pipeline_ingress_hub = _manager.PipelineIngressHub()
 
         _storage_keyed_lock = KeyedUnifiedLock()
 
@@ -1519,6 +1557,7 @@ def initialize_share_data(
         _shared_dicts = {}
         _init_flags = {}
         _update_flags = {}
+        _pipeline_ingress_hub = None  # multiprocess-only server-side hub
         _async_locks = None  # No need for async locks in single process mode
 
         _storage_keyed_lock = KeyedUnifiedLock()
@@ -1559,7 +1598,7 @@ async def initialize_pipeline_status(workspace: str | None = None):
                 # accepted document, so reservation and the enqueue
                 # last-line guard reject when this is True.  ``busy`` on
                 # its own (the processing loop) remains compatible with
-                # concurrent enqueue via request_pending.
+                # concurrent enqueue via the pipeline ingress mailbox.
                 "destructive_busy": False,
                 "scanning": False,  # /documents/scan task running (whole lifecycle)
                 # Exclusive subset of ``scanning``: only True during the
@@ -1583,7 +1622,6 @@ async def initialize_pipeline_status(workspace: str | None = None):
                 "docs": 0,  # Total number of documents to be indexed
                 "batchs": 0,  # Number of batches for processing documents
                 "cur_batch": 0,  # Current processing batch
-                "request_pending": False,  # Flag for pending request for processing
                 "latest_message": "",  # Latest message from pipeline processing
                 "history_messages": history_messages,  # 使用共享列表对象
                 # ---- reservation owner tokens (cancellation-safe release) ----
@@ -1606,6 +1644,108 @@ async def initialize_pipeline_status(workspace: str | None = None):
         direct_log(
             f"Process {os.getpid()} Pipeline namespace '{final_namespace}' initialized"
         )
+
+
+def _ensure_ingress_on_current_loop(ingress: Any, final_namespace: str) -> None:
+    """Bind a single-process ingress to the caller's loop, LightRAG-style.
+
+    Follows the sync-wrapper convention (see ``lightrag.py``: an object built
+    under one ``asyncio.run()`` keeps working from later loops once the first
+    loop closed): an ingress whose owning loop is CLOSED is migrated in place
+    to the current loop with all state preserved.  Only genuine cross-loop
+    sharing — the owning loop still running elsewhere — fast-fails, because
+    plain asyncio primitives would corrupt waits silently.  Multiprocess hub
+    views are loop-agnostic (no ``owning_loop`` attribute).
+    """
+    owning_loop = getattr(ingress, "owning_loop", None)
+    if owning_loop is None or owning_loop is asyncio.get_running_loop():
+        return
+    if owning_loop.is_closed():
+        ingress.rebind_to_current_loop()
+        return
+    # A stopped-but-not-closed foreign loop is also rejected: it cannot be
+    # distinguished from one that will resume, and migrating out from under a
+    # resumable loop would corrupt its waiters. asyncio.run() always closes
+    # its loop, so the standard LightRAG sync-wrapper flow never hits this.
+    raise RuntimeError(
+        f"pipeline ingress '{final_namespace}' belongs to another event "
+        "loop that has not been closed; single-process ingress objects "
+        "cannot be shared across live loops (create the LightRAG instances "
+        "for one workspace on the same loop, or run multi-worker mode)"
+    )
+
+
+async def get_pipeline_ingress(workspace: str | None = None):
+    """Get (or lazily create) the ingress view for ``workspace``.
+
+    Same-workspace callers always reach the SAME state: single-process a
+    per-process :class:`AsyncioPipelineIngress` (migrated between loops per
+    the sync-wrapper convention), multiprocess a
+    :class:`ManagerPipelineIngress` view binding the namespace to the one
+    server-side hub.  No client-held lock anywhere: single-process the
+    check-and-insert below has no await (atomic on the loop; ``setdefault``
+    guards hypothetical multi-loop threads), multiprocess the hub creates the
+    mailbox atomically inside one server-side dispatch — a client SIGKILLed
+    at any point can neither strand creation nor race a duplicate.
+
+    SUSPENSION-FREE BY CONTRACT: despite being ``async`` (call-site
+    uniformity), this function must never contain a real ``await`` — the
+    custom-chunks and batch-delete exit paths resolve the ingress inside
+    slot-releasing ``finally`` blocks BEFORE their cancellation-resistant
+    release, where a suspension point would let a pending re-cancellation
+    skip the release and wedge ``busy``/``destructive_busy``.
+    """
+    if _pipeline_ingress_local is None:
+        direct_log(
+            f"Error: Try to get pipeline ingress before initialization, pid={os.getpid()}",
+            level="ERROR",
+        )
+        raise ValueError("Shared dictionaries not initialized")
+
+    final_namespace = get_final_namespace("pipeline_ingress", workspace)
+
+    ingress = _pipeline_ingress_local.get(final_namespace)
+    if ingress is None:
+        if _is_multiprocess and _pipeline_ingress_hub is not None:
+            created: Any = ManagerPipelineIngress(
+                _pipeline_ingress_hub, final_namespace
+            )
+        else:
+            created = AsyncioPipelineIngress()
+        ingress = _pipeline_ingress_local.setdefault(final_namespace, created)
+        if ingress is created:
+            direct_log(
+                f"Process {os.getpid()} Pipeline ingress '{final_namespace}' resolved"
+            )
+    _ensure_ingress_on_current_loop(ingress, final_namespace)
+    return ingress
+
+
+async def initialize_pipeline_ingress(workspace: str | None = None) -> None:
+    """Ensure the workspace ingress exists (idempotent)."""
+    await get_pipeline_ingress(workspace)
+
+
+async def finalize_pipeline_ingress(workspace: str | None = None) -> None:
+    """Drop the workspace ingress from THIS process's registry.
+
+    Teardown/tests ONLY.  The ingress is shared by every LightRAG instance of
+    the workspace, so ``LightRAG.finalize_storages()`` must never call this —
+    a surviving instance would lose sticky manual requests and in-flight
+    notifications.  Idempotent.
+
+    Single-process, this fully drops the instance (a later
+    :func:`get_pipeline_ingress` builds a fresh, empty one).  Multiprocess,
+    only the local namespace view is dropped — the server-side mailbox keeps
+    its state inside the hub (workspace identity is the namespace string, so
+    re-resolution reaches the same mailbox) and is reclaimed only by
+    :func:`finalize_share_data`; a destructive workspace wipe empties it via
+    ``ingress.clear()`` instead.
+    """
+    if _pipeline_ingress_local is None:
+        return
+    final_namespace = get_final_namespace("pipeline_ingress", workspace)
+    _pipeline_ingress_local.pop(final_namespace, None)
 
 
 def _debug_log_failure(message: str, exc: Exception) -> None:
@@ -1658,7 +1798,7 @@ class PipelineStatusLogger:
       ``async with pipeline_status_lock`` (see the processing loop).
 
     Why lock-free is safe: this is for pure status logging ONLY, never for
-    coordination state (``busy`` / ``request_pending`` / ``cancellation_*`` /
+    coordination state (``busy`` / ``cancellation_*`` /
     reservation owner tokens / ``cur_batch`` / the history trim), which stays
     in ``async with pipeline_status_lock`` read-modify-write blocks. Each of
     ``dict.__setitem__`` and ``list.extend`` is a single indivisible operation
@@ -2161,16 +2301,25 @@ async def acquire_processing_reservation(
     *,
     token: str,
     already_held: bool,
+    pipeline_ingress,
     flags: Mapping[str, Any],
 ) -> PipelineReservationResult:
     """Acquire/take over the single processing slot from one proxy snapshot.
 
     Refuses the slot (without taking it) while a scan holds ``scanning_exclusive``
     — its classification phase mutates doc_status — and reduces a competing
-    ``busy`` holder to a ``request_pending`` nudge, both in the same update used
-    for any recovery changes. A handed-off run (``already_held``) is exempt from
-    both: it already owns the slot. The caller may owner-check release
-    unconditionally because the token is stamped atomically with ``busy``.
+    ``busy`` holder to an auto-rescan arm on ``pipeline_ingress``, inside the
+    same critical section as the refusal decision: arming after returning BUSY
+    would let the current holder release between the two and never see the
+    signal. A handed-off run (``already_held``) is exempt from both: it already
+    owns the slot. The caller may owner-check release unconditionally because
+    the token is stamped atomically with ``busy``.
+
+    ``pipeline_ingress`` MUST be resolved by the caller before this call — a
+    lazy resolve while ``pipeline_status_lock`` is held would nest a Manager
+    lookup inside the critical section. ``request_auto_rescan`` is a single
+    RPC; a failure propagates so the refused caller learns its wake-up signal
+    was NOT committed (the docs stay PENDING for the next initial scan).
     """
     async with pipeline_status_lock:
         snapshot, recovery_updates = _prepare_pipeline_reservation_decision(
@@ -2205,11 +2354,15 @@ async def acquire_processing_reservation(
                 snapshot=snapshot,
             )
         if not already_held and snapshot.get("busy"):
-            updates = {"request_pending": True}
-            snapshot.update(updates)
-            _commit_pipeline_reservation_updates(
-                pipeline_status, recovery_updates, updates
-            )
+            # Commit any recovery changes first (idempotent — recomputed by
+            # the next acquire if the arm below raises), then arm the
+            # auto-rescan flag so the busy holder's quiescence decision picks
+            # this request up. Same critical section as the refusal: the
+            # holder's release runs under this very lock, so the arm either
+            # lands before its decision (seen) or the holder already released
+            # (busy=False — this acquire would have succeeded instead).
+            _commit_pipeline_reservation_updates(pipeline_status, recovery_updates)
+            pipeline_ingress.request_auto_rescan()
             return PipelineReservationResult(
                 acquired=False,
                 conflict=PipelineReservationConflict.BUSY,
@@ -2299,7 +2452,7 @@ async def with_reservation_lock(
     ``token``); otherwise no-op and return ``None``.
 
     ``action`` is SYNCHRONOUS (no await) and must apply all correctness-critical
-    mutations (owner, busy/scanning flags, request_pending, cancellation flags,
+    mutations (owner, busy/scanning flags, cancellation flags,
     operation_record, recovery state) via a SINGLE ``status.update`` so a crash
     cannot tear them apart. ``history_messages`` (a Manager list) must be mutated
     in place, not replaced. Runs to completion even under repeated cancellation
@@ -2523,6 +2676,180 @@ async def start_reserved_background_task(
     if cancel is not None:
         raise cancel
     raise RuntimeError("reserved background task failed to start")
+
+
+class ManualIntentRefused(Exception):
+    """A manual-intent commit was refused by the pipeline fence.
+
+    Raised by :func:`start_committed_background_task` when ``commit`` returned
+    a refusal: the fence rejected the request BEFORE the sticky message was
+    published, so no side effect exists and the endpoint can surface the
+    message (e.g. as a 503) without any cleanup.
+    """
+
+
+async def commit_manual_retry_request(
+    pipeline_status: Dict[str, Any],
+    pipeline_status_lock,
+    ingress,
+    request_id: str,
+    state: Dict[str, Any],
+) -> Optional[str]:
+    """Fence recheck + sticky manual-retry publish in ONE critical section.
+
+    The commit step of the two-state startup protocol for
+    ``/documents/reprocess_failed``: checking the fence and publishing in
+    separate critical sections would let a destructive clear take its
+    reservation in between — the request would then be accepted against
+    storages that are about to be dropped.  Refusals happen strictly BEFORE
+    the publish, so a refused call has zero side effects.
+
+    ``state["committed"] = True`` is set synchronously right after the
+    publish (no await in between): the startup helper keys its
+    cancel-behavior on it, and a cancellation landing in the lock's
+    ``__aexit__`` must already count as committed — the sticky request
+    exists and someone has to own driving it.
+
+    ``ingress`` must be resolved by the caller BEFORE this call — never
+    lazily while the pipeline status lock is held.
+
+    Returns ``None`` on success, or the human-readable refusal message.
+    """
+    message = PipelineIngressMessage(
+        kind="rescan", retry_failed=True, request_id=request_id
+    )
+    async with pipeline_status_lock:
+        snapshot, recovery_updates = _prepare_pipeline_reservation_decision(
+            pipeline_status
+        )
+        if snapshot.get("recovery_required"):
+            _commit_pipeline_reservation_updates(pipeline_status, recovery_updates)
+            return pipeline_recovery_blocked_message(snapshot)
+        if snapshot.get("destructive_busy"):
+            _commit_pipeline_reservation_updates(pipeline_status, recovery_updates)
+            return (
+                "A clear/delete operation is dropping storages; a manual "
+                "retry accepted now would be wiped with them. Retry after "
+                "it finishes."
+            )
+        _commit_pipeline_reservation_updates(pipeline_status, recovery_updates)
+        if not ingress.request_manual_retry(request_id, message):
+            # The id is already terminal (ACKED / CANCELLED_BY_CLEAR): nothing
+            # was published and nothing is owned. Unreachable for the current
+            # callers (they mint a fresh uuid per request) but a future caller
+            # reusing ids must get a refusal, not a phantom commit.
+            return (
+                f"manual retry request id {request_id!r} was already "
+                "finalized; mint a new request id"
+            )
+        state["committed"] = True
+        return None
+
+
+async def start_committed_background_task(
+    background_tasks: set, *, commit, work, backstop_release
+):
+    """Two-state commit/ownership startup for manual-intent endpoints.
+
+    ``start_reserved_background_task`` cancels its child on ANY caller
+    cancellation — even after takeover — which would orphan a just-published
+    sticky manual request (the intent exists, but the task that owns driving
+    it is dead).  This helper splits startup into two states instead:
+
+    ``NOT_COMMITTED`` → ``commit(state)`` runs first inside the child (fence
+    recheck + sticky publish in one ``pipeline_status_lock`` critical
+    section, setting ``state["committed"] = True`` synchronously after the
+    publish) → ``COMMITTED_AND_OWNED`` → ``work()``.
+
+    HARD REQUIREMENT on ``commit`` implementations: between the fence
+    decision and ``state["committed"] = True`` there must be NO await other
+    than acquiring the pipeline status lock itself — the cancel-behavior
+    below keys on that marker, and an await in that window would open a race
+    where a caller cancellation lands mid-commit with the publish already
+    visible but the marker unset (the intent would be torn down as if never
+    published).
+
+    Rules keyed on the commit state at caller-cancellation time:
+
+    * NOT_COMMITTED: cancel the child, join it, run ``backstop_release`` —
+      no manual request was published, nothing is owned, the original
+      cancellation propagates.
+    * COMMITTED_AND_OWNED: the child is NOT cancelled — it keeps running and
+      releases its own reservation; the caller's cancellation propagates so
+      the endpoint knows ownership transferred and must not release again.
+
+    A child that ends without committing either refused (``commit`` returned
+    a message → :class:`ManualIntentRefused`) or crashed pre-commit; both run
+    ``backstop_release`` (owner-checked, idempotent).  A child that crashes
+    AFTER committing but before ``work`` still gets its reservation released
+    via ``backstop_release`` — the sticky request itself stays for the next
+    run to consume, which is exactly the sticky contract.
+
+    Known boundary (documented, not solved here): if the server commits but
+    the HTTP response never reaches the client, a client retry mints a new
+    request_id and earns one more attempt — server-generated ids cannot be
+    idempotent across that gap; supply a client idempotency key if that
+    matters.
+    """
+    state: Dict[str, Any] = {"committed": False, "refusal": None}
+    started = asyncio.Event()
+
+    async def _child():
+        refusal = await commit(state)
+        if refusal is not None:
+            state["refusal"] = refusal
+            return
+        started.set()
+        await work()
+
+    task = asyncio.ensure_future(_child())
+    background_tasks.add(task)
+
+    def _done(t):
+        background_tasks.discard(t)
+        if not t.cancelled():
+            exc = t.exception()
+            if exc is not None:
+                direct_log(
+                    f"Committed background task failed: {exc}",
+                    level="ERROR",
+                    enable_output=True,
+                )
+
+    task.add_done_callback(_done)
+
+    waiter = asyncio.ensure_future(started.wait())
+    caller_cancel = None
+    try:
+        await asyncio.wait({waiter, task}, return_when=asyncio.FIRST_COMPLETED)
+    except asyncio.CancelledError as exc:
+        caller_cancel = exc
+    finally:
+        if not waiter.done():
+            waiter.cancel()
+
+    if caller_cancel is not None:
+        if state["committed"]:
+            # Ownership transferred: the child owns its reservation and the
+            # published intent. Never cancel it; the endpoint's finally must
+            # not release either.
+            raise caller_cancel
+        task.cancel()
+        join_cancel = await _join_resistant(task)
+        await backstop_release()
+        raise caller_cancel or join_cancel
+
+    if started.is_set():
+        return task  # child took over; its own finally owns the release
+
+    # Child ended before takeover: refusal, or a crash before/inside commit.
+    join_cancel = await _join_resistant(task)
+    await backstop_release()
+    if join_cancel is not None:
+        raise join_cancel
+    if state["refusal"] is not None:
+        raise ManualIntentRefused(state["refusal"])
+    raise RuntimeError("committed background task failed to start")
 
 
 async def drain_reserved_background_tasks(
@@ -2872,7 +3199,9 @@ def finalize_share_data():
         _global_concurrency_limits, \
         _lease_ns_cache, \
         _queue_stats_ns_cache, \
-        _namespace_data_cache
+        _namespace_data_cache, \
+        _pipeline_ingress_local, \
+        _pipeline_ingress_hub
 
     # Check if already initialized
     if not _initialized:
@@ -2942,6 +3271,8 @@ def finalize_share_data():
     _lease_ns_cache = None
     _queue_stats_ns_cache = None
     _namespace_data_cache = None
+    _pipeline_ingress_local = None
+    _pipeline_ingress_hub = None
 
     direct_log(f"Process {os.getpid()} storage data finalization complete")
 
