@@ -113,6 +113,7 @@ from lightrag.utils_pipeline import (
     # and the parser CLI / base archive path patch them there.
     archive_docx_source_after_full_docs_sync,  # noqa: F401
     parsed_artifact_dir_for,  # noqa: F401
+    apply_trusted_sentence_split_regex,
     archive_source_after_full_docs_sync,
     build_chunks_dict_from_chunking_result,
     chunk_fields_from_status_doc,
@@ -649,7 +650,12 @@ class _PipelineMixin:
                 :meth:`LightRAG.ainsert` — should call
                 :func:`resolve_chunk_options` themselves and pass the
                 result here; this function is intentionally chunker-
-                config agnostic.  See
+                config agnostic.  One key is NOT honored from the
+                snapshot: ``semantic_vector.sentence_split_regex`` is
+                re-read live from ``addon_params`` at process time and a
+                snapshot value is discarded (logged at WARNING) — see
+                :func:`lightrag.utils_pipeline.apply_trusted_sentence_split_regex`
+                and GHSA-32jh-39m7-8x84.  See
                 ``docs/FileProcessingConfiguration-zh.md`` for the schema.
             admission_token: the pending-enqueue reservation the caller already
                 holds (endpoints reserve one before reading the request body).
@@ -2261,9 +2267,8 @@ class _PipelineMixin:
         await self._admit_fed_document(ctx, doc_id, status_doc, full_doc)
         return True  # admitted
 
-    @staticmethod
     def _feeder_should_yield(
-        ctx: "_BatchRunContext", ingress, *, check_auto: bool
+        self, ctx: "_BatchRunContext", ingress, *, check_auto: bool
     ) -> bool:
         """True when the feeder must stop admitting and let the batch reach its
         quiescence point:
@@ -2273,13 +2278,35 @@ class _PipelineMixin:
           starve it) — both re-checked before every single admission, so the
           yield latency is one admission, not a whole drain;
         * (``check_auto``, at the top of each drain) the auto-rescan flag is
-          dirty — a document-channel overflow dropped notifications, a partial
-          upsert landed, or one of this feeder's own skips armed it. Yielding
-          hands the batch to its boundary, where the supervisor consumes the
-          flag and its strict rescan recovers those dropped/deferred PENDING
-          docs; without it a sustained stream that never lets the batch reach a
-          boundary would starve them. The feeder only PEEKS the flag (via
-          ``counts``); the supervisor remains its sole consumer.
+          dirty AND this epoch is unbounded (``PIPELINE_SCHEDULING_PAGE_SIZE=0``
+          disables ``_feeder_epoch_full``).
+
+          The flag is the coarse "only a strict rescan can find this work"
+          signal — an overflow dropped notifications, a partial upsert landed,
+          one of this feeder's own skips armed it, or a wake-up was refused
+          because this very run holds ``busy`` — and only the supervisor's
+          boundary rescan can serve it. But yielding does NOT bring that
+          boundary closer on its own: the boundary is the queue-join cascade in
+          :meth:`_run_pipeline_batch` (which then cancels this feeder), and a
+          feeder parked on ``wait_for_documents`` holds no unfinished queue
+          item, so it never delays a join. The ONLY way the feeder can postpone
+          the boundary is by admitting new work indefinitely — and with paging
+          on, ``_feeder_epoch_full`` already caps that at
+          ``PIPELINE_SCHEDULING_PAGE_SIZE`` admissions per epoch, so the flag is
+          served within one bounded epoch. Yielding on it as well buys nothing
+          and costs the accelerator: every per-file ``/upload`` calls
+          ``apipeline_process_enqueue_documents`` after its enqueue, each such
+          call is refused while a batch runs, and each refusal arms this flag
+          (see ``acquire_processing_reservation``) — so a bare-flag yield killed
+          the feeder for the rest of the batch on the SECOND uploaded file and
+          stranded every later file in the mailbox until the batch barrier.
+
+          With paging disabled there is no admission cap, so a sustained stream
+          could keep this epoch alive forever; there the dirty flag still
+          yields.
+
+          The feeder only PEEKS the flag (via ``counts``); the supervisor
+          remains its sole consumer.
 
         NOT ``has_work()`` — that would busy-loop on a pending manual/auto entry.
         """
@@ -2287,7 +2314,11 @@ class _PipelineMixin:
             return True
         if ingress.peek_next_manual_retry() is not None:
             return True
-        if check_auto and ingress.counts().get("auto_rescan_pending"):
+        if (
+            check_auto
+            and getattr(self, "pipeline_scheduling_page_size", 0) <= 0
+            and ingress.counts().get("auto_rescan_pending")
+        ):
             return True
         return False
 
@@ -2333,7 +2364,9 @@ class _PipelineMixin:
         cancellation is requested (otherwise ``/cancel_pipeline`` could never
         complete under a sustained upload stream that keeps the parse queue
         non-empty) or when a sticky manual retry request is waiting (it is only
-        consumed at the batch boundary, so an unbounded batch would starve it).
+        consumed at the batch boundary, so an unbounded batch would starve it),
+        or — only with paging disabled, where nothing else caps this epoch's
+        admissions — when the auto-rescan flag is dirty.
         This is re-checked before the drain AND before EVERY admission
         (:meth:`_feeder_should_yield`), so a signal that lands while the feeder
         is admitting a full drain is honored within one admission, not after up
@@ -2360,10 +2393,10 @@ class _PipelineMixin:
                     # Top-of-drain yield check is INSIDE the try so a transient
                     # manual-peek / counts RPC failure (multiprocess) is logged
                     # and retried, not left to silently kill the feeder. Includes
-                    # the auto-rescan flag (overflow / partial upsert / this
-                    # feeder's own skips) so a sustained stream still reaches a
-                    # boundary where the supervisor's rescan recovers the dropped
-                    # PENDING docs.
+                    # the auto-rescan flag ONLY when this epoch is unbounded —
+                    # with paging on, the epoch cap below is what bounds the
+                    # batch, and a busy-refused upload wake-up arms that flag on
+                    # every file (see _feeder_should_yield).
                     if self._feeder_should_yield(ctx, ingress, check_auto=True):
                         return
                     # Single-epoch bound (LR2 §6.4): once this batch holds
@@ -4823,6 +4856,14 @@ class _PipelineMixin:
                         v_opts = dict(chunk_opts.get("semantic_vector") or {})
                         v_chunk_size = int(
                             v_opts.pop("chunk_token_size", resolved_chunk_size)
+                        )
+                        # ``sentence_split_regex`` is the one key that does NOT
+                        # win from the per-doc snapshot: it is re-read live from
+                        # the operator-controlled config so a pattern persisted
+                        # by a pre-fix build cannot freeze this worker on resume
+                        # (GHSA-32jh-39m7-8x84). See the helper's docstring.
+                        v_opts = apply_trusted_sentence_split_regex(
+                            v_opts, self.addon_params, doc_id=doc_id
                         )
                         chunk_opts_str = _format_chunking_params(v_chunk_size, v_opts)
                         logger.info(f"Chunking V: {chunk_opts_str}, doc_id: {doc_id}")

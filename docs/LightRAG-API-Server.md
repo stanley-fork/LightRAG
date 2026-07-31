@@ -222,7 +222,7 @@ During startup, configurations in the `.env` file can be overridden by command-l
 
 ### Path Prefix and Multi-Site WebUI
 
-Set `LIGHTRAG_API_PREFIX` or `--api-prefix` when one host serves multiple LightRAG instances behind a reverse proxy that strips a site prefix before forwarding to the backend:
+Set `LIGHTRAG_API_PREFIX` or `--api-prefix` when one host serves multiple LightRAG instances behind a reverse proxy. Either forwarding style works: the proxy may strip the site prefix before forwarding to the backend, or forward the request unchanged.
 
 ```bash
 LIGHTRAG_API_PREFIX=/site01
@@ -230,6 +230,8 @@ lightrag-server --port 9621
 ```
 
 The backend passes this value to FastAPI as `root_path` and injects the same runtime prefix into the WebUI. The WebUI is always mounted at `/webui` inside the server, so one frontend build can serve any prefix. See [Single-Server Multi-Site Deployment](./MultiSiteDeployment.md) for full Nginx, Docker, and Kubernetes examples.
+
+> **`WHITELIST_PATHS` is written without the prefix.** Its entries are internal route paths, exactly as the routes are declared. The mount prefix is removed before matching, in both forwarding styles, so with `LIGHTRAG_API_PREFIX=/site01` the shipped default `WHITELIST_PATHS=/health,/api/*` is already correct and exempts `/site01/health` as the browser sees it. Writing the browser-visible form (`WHITELIST_PATHS=/site01/health`) matches nothing and makes those paths require authentication.
 
 ### Launching LightRAG Server with Docker
 
@@ -639,6 +641,8 @@ WHITELIST_PATHS=/health,/api/*
 ```
 
 > Health check and Ollama emulation endpoints are excluded from API Key check by default. For security reasons, remove `/api/*` from `WHITELIST_PATHS` if the Ollama service is not required. `/health` stays whitelisted as a liveness probe but only returns its full configuration to authenticated callers — unauthenticated requests get liveness signals only.
+>
+> **Entries are internal route paths, never prefixed.** A `/*` suffix matches on path-segment boundaries, so `/api/*` covers `/api` and everything under `/api/` and nothing else. If `LIGHTRAG_API_PREFIX` is set, do **not** include it here: the prefix is removed before matching, so `WHITELIST_PATHS=/health` exempts `/site01/health` and `WHITELIST_PATHS=/site01/health` exempts nothing. See [Path Prefix and Multi-Site WebUI](#path-prefix-and-multi-site-webui).
 
 The API key is passed using the request header `X-API-Key`. Below is an example of accessing the LightRAG Server via API:
 
@@ -1167,6 +1171,10 @@ Processing options are appended after the engine with a hyphen, or supplied alon
 | `P` | Paragraph semantic chunking for structured LightRAG Document content; falls back to `R` when structured content is unavailable |
 
 At most one of `F`, `R`, `V`, and `P` should be selected for a file. Chunker parameters are configured with `CHUNK_SIZE`, `CHUNK_OVERLAP_SIZE`, and strategy-specific variables such as `CHUNK_R_SEPARATORS`, `CHUNK_V_BREAKPOINT_THRESHOLD_TYPE`, `CHUNK_P_SIZE`, and `CHUNK_P_OVERLAP_SIZE`. These values are read at server startup and stored as a per-document `chunk_options` snapshot when a document is enqueued.
+
+The `V` strategy's sentence splitter is the one chunker parameter that cannot be set per request: `CHUNK_V_SENTENCE_SPLIT_REGEX` (or the SDK's `addon_params`) is the only way to change it. `/documents/text` and `/documents/texts` reject a `sentence_split_regex` key inside `chunking.params` with HTTP 422. A caller-supplied pattern is applied to that same request's text, and CPython's regex engine holds the GIL while backtracking, so a pattern such as `(a+)+$` can freeze an entire worker process — see [GHSA-32jh-39m7-8x84](https://github.com/HKUDS/LightRAG/security/advisories/GHSA-32jh-39m7-8x84). A value already stored in a document's `chunk_options` snapshot is discarded at processing time as well (logged at `WARNING`), so a pattern persisted by an older build cannot freeze the worker after an upgrade.
+
+The `R` strategy's per-request `separators` list is capped at 64 entries (HTTP 422 beyond that); the built-in cascade is 9. The operator-side `CHUNK_R_SEPARATORS` is not capped.
 
 For the full routing syntax, supported extensions, parser cache behavior, chunker configuration, concurrency rules, and Python SDK differences, see [File Processing Pipeline Specification](./FileProcessingPipeline.md). For the `P` strategy details, see [Paragraph Semantic Chunking](./ParagraphSemanticChunking.md). To debug parser output before indexing a file, see [Parser Debug CLI](./ParserDebugCLI.md).
 
