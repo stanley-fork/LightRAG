@@ -9,7 +9,6 @@ import rehypeReact from 'rehype-react'
 import rehypeRaw from 'rehype-raw'
 import rehypeSanitize from 'rehype-sanitize'
 import remarkMath from 'remark-math'
-import mermaid from 'mermaid'
 import { remarkFootnotes } from '@/utils/remarkFootnotes'
 import { chatMarkdownSanitizeSchema } from '@/utils/markdownSanitizeSchema'
 
@@ -30,22 +29,28 @@ interface KaTeXOptions {
   errorCallback?: (error: string, latex: string) => void;
 }
 
-export type MessageWithError = Message & {
-  id: string // Unique identifier for stable React keys
-  isError?: boolean
-  isThinking?: boolean // Flag to indicate if the message is in a "thinking" state
-  isAborted?: boolean // Flag to indicate the user terminated this query (response may be incomplete)
-  /**
-   * Indicates if the mermaid diagram in this message has been rendered.
-   * Used to persist the rendering state across updates and prevent flickering.
-   */
-  mermaidRendered?: boolean
-  /**
-   * Indicates if the LaTeX formulas in this message are complete and ready for rendering.
-   * Used to prevent red error text during streaming of incomplete LaTeX formulas.
-   */
-  latexRendered?: boolean
-}
+// MessageWithError moved to the retrieval types module so the UI-free query
+// session controller does not depend on this rendering component; re-exported
+// here for existing importers.
+import type { MessageWithError } from '@/types/retrieval'
+export type { MessageWithError } from '@/types/retrieval'
+
+// Both entries share ChatMessage, so mermaid MUST NOT be a static import —
+// it would land in the workspace entry's first-load closure. It is loaded on
+// demand when a complete ```mermaid``` block is actually rendered, keeping
+// full Mermaid support in both entries.
+const loadMermaid = () => import('mermaid').then((m) => m.default)
+
+/**
+ * Tables scroll INSIDE their own block. The message list scrolls vertically
+ * only (see MessageList), so a table wider than the conversation column would
+ * otherwise be clipped and unreachable on a narrow screen.
+ */
+const ScrollableTable = ({ children }: { children?: ReactNode }) => (
+  <div className="my-2 max-w-full overflow-x-auto">
+    <table>{children}</table>
+  </div>
+)
 
 // Restore original component definition and export
 export const ChatMessage = ({
@@ -154,11 +159,13 @@ export const ChatMessage = ({
     h4: ({ children }: { children?: ReactNode }) => <h4 className="text-base font-semibold mt-3 mb-2">{children}</h4>,
     ul: ({ children }: { children?: ReactNode }) => <ul className="list-disc pl-5 my-2">{children}</ul>,
     ol: ({ children }: { children?: ReactNode }) => <ol className="list-decimal pl-5 my-2">{children}</ol>,
-    li: ({ children }: { children?: ReactNode }) => <li className="my-1">{children}</li>
+    li: ({ children }: { children?: ReactNode }) => <li className="my-1">{children}</li>,
+    table: ScrollableTable
   }), [message.mermaidRendered, message.role]);
 
   const thinkingMarkdownComponents = useMemo(() => ({
-    code: (props: any) => (<CodeHighlight {...props} renderAsDiagram={message.mermaidRendered ?? false} messageRole={message.role} />)
+    code: (props: any) => (<CodeHighlight {...props} renderAsDiagram={message.mermaidRendered ?? false} messageRole={message.role} />),
+    table: ScrollableTable
   }), [message.mermaidRendered, message.role]);
 
   // Whether the assistant has begun emitting visible answer text. Drives both
@@ -194,6 +201,11 @@ export const ChatMessage = ({
       </div>
     ) : null
 
+  // The bubble shares its flex row with a fixed-width copy button (24px plus
+  // an 8px gap), and its percentage width knows nothing about that. `min-w-0`
+  // is therefore required, not cosmetic: without it the flex item's automatic
+  // minimum size pins the bubble at 95% and the row overflows by ~32px on a
+  // phone-width screen.
   return (
     <div
       className={`${
@@ -202,7 +214,7 @@ export const ChatMessage = ({
           : message.isError
             ? 'w-[95%] bg-red-100 text-red-600 dark:bg-red-950 dark:text-red-400'
             : 'w-[95%] bg-muted'
-      } rounded-lg px-4 py-2`}
+      } min-w-0 rounded-lg px-4 py-2`}
     >
       {/* Before any answer text: the timing row sits on top and the thinking
           hint appears beneath it, so the time doesn't jump when "Thinking..."
@@ -429,11 +441,42 @@ const CodeHighlight = memo(({ inline, className, children, renderAsDiagram = fal
         clearTimeout(debounceTimerRef.current);
       }
 
-      debounceTimerRef.current = setTimeout(() => {
+      debounceTimerRef.current = setTimeout(async () => {
         if (!container) return; // Container might have unmounted
 
         // Double check hasRendered state inside timeout, in case it changed rapidly
         if (hasRendered) return;
+
+        // Dynamic import: mermaid stays out of both entries' first-load
+        // closure and is fetched only when a diagram is actually rendered.
+        let mermaid: Awaited<ReturnType<typeof loadMermaid>>;
+        try {
+          mermaid = await loadMermaid();
+        } catch (loadError) {
+          // The renderer itself could not be fetched — a deploy invalidated
+          // the hashed chunk mid-session, an offline tab, a flaky network.
+          //
+          // This MUST write something visible, like the two render-failure
+          // paths below. Nothing has been put in the container yet (the
+          // loading indicator is set only after this await), the effect's
+          // dependencies cannot change again once the message settles, so
+          // nothing retries, and the plain-text fallback branch in the
+          // render body only runs while `renderAsDiagram` is false. A bare
+          // return therefore leaves a permanently blank gap where a diagram
+          // belongs, with the source unreachable too.
+          console.error('Failed to load mermaid:', loadError);
+          if (mermaidRef.current === container) {
+            const errorMessage =
+              loadError instanceof Error ? loadError.message : String(loadError);
+            const fallbackPre = document.createElement('pre');
+            fallbackPre.className = 'text-red-500 text-xs whitespace-pre-wrap break-words';
+            fallbackPre.textContent = `Mermaid renderer failed to load: ${errorMessage}\n\nContent:\n${String(children).replace(/\n$/, '').trim()}`;
+            container.innerHTML = '';
+            container.appendChild(fallbackPre);
+          }
+          return;
+        }
+        if (mermaidRef.current !== container || hasRendered) return;
 
         try {
           // Initialize mermaid config
