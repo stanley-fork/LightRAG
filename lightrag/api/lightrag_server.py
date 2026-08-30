@@ -1597,6 +1597,14 @@ def create_app(args):
     # diverge from the real route table.
     api_docs_enabled = bool(getattr(args, "enable_api_docs", True))
 
+    # Whether the two query UIs label every answer as AI-generated
+    # (ENABLE_AI_CONTENT_NOTICE). Deployment-level display configuration, so
+    # it rides the same responses as webui_title/webui_description: both
+    # entries read it once at boot from /auth-status (or /login), and the
+    # admin shell keeps it fresh from its /health poll. getattr keeps
+    # create_app working for callers that build args programmatically.
+    ai_content_notice_enabled = bool(getattr(args, "enable_ai_content_notice", False))
+
     base_description = (
         "Providing API for LightRAG core, Web UI and Ollama Model Emulation"
     )
@@ -2645,6 +2653,7 @@ def create_app(args):
                 "api_version": api_version_display,
                 "webui_title": webui_title,
                 "webui_description": webui_description,
+                "ai_content_notice_enabled": ai_content_notice_enabled,
             }
 
         return {
@@ -2654,6 +2663,7 @@ def create_app(args):
             "api_version": api_version_display,
             "webui_title": webui_title,
             "webui_description": webui_description,
+            "ai_content_notice_enabled": ai_content_notice_enabled,
         }
 
     # Brute-force protection for /login (CWE-307): throttle failed attempts per
@@ -2682,6 +2692,7 @@ def create_app(args):
                 "api_version": api_version_display,
                 "webui_title": webui_title,
                 "webui_description": webui_description,
+                "ai_content_notice_enabled": ai_content_notice_enabled,
             }
         username = form_data.username
         # Rate-limit key is client IP + username. X-Forwarded-For is NOT trusted
@@ -2740,6 +2751,7 @@ def create_app(args):
             "api_version": api_version_display,
             "webui_title": webui_title,
             "webui_description": webui_description,
+            "ai_content_notice_enabled": ai_content_notice_enabled,
         }
 
     @app.get(
@@ -2875,6 +2887,7 @@ def create_app(args):
                 "api_docs_available": api_docs_enabled,
                 "webui_title": webui_title,
                 "webui_description": webui_description,
+                "ai_content_notice_enabled": ai_content_notice_enabled,
                 "pipeline_busy": pipeline_busy,
                 "pipeline_active": pipeline_active,
             }
@@ -2986,14 +2999,25 @@ def create_app(args):
     # `</` → `<\/` escaping prevents an embedded "</script>" sequence from
     # breaking out of the inline script (defense-in-depth — values come from
     # admin config, not user input).
+    #
+    # `webuiTitle` (WEBUI_TITLE) rides along and is applied to `document.title`
+    # in the same snippet: the tag sits in <head> right after the static
+    # <title>, so the tab carries the deployment's own name from the FIRST
+    # paint. Waiting for the SPA to read it from /health would show "LightRAG"
+    # until the bundle boots, and browsers cache that first title for history
+    # entries and bookmarks. `or None` normalizes an unset/empty variable to a
+    # single falsy value, which the client reads as "no custom title".
     _runtime_config_payload = json.dumps(
         {
             "apiPrefix": api_prefix,
             "webuiPrefix": f"{api_prefix}{webui_path}/",
+            "webuiTitle": webui_title or None,
         }
     ).replace("</", "<\\/")
     runtime_config_script = (
-        f"<script>window.__LIGHTRAG_CONFIG__ = {_runtime_config_payload};</script>"
+        f"<script>window.__LIGHTRAG_CONFIG__ = {_runtime_config_payload};"
+        "if(window.__LIGHTRAG_CONFIG__.webuiTitle)"
+        "{document.title=window.__LIGHTRAG_CONFIG__.webuiTitle;}</script>"
     )
 
     # Custom StaticFiles class for smart caching + runtime config injection
