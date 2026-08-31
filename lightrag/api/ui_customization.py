@@ -2,8 +2,8 @@
 
 A deployment may point ``UI_TEMPLATES_DIR`` at an external, read-only bundle
 directory that provides the welcome page / query-empty-state texts, the
-optional login-page blurb and user-agreement document, and brand logos for the
-WebUI entries, per locale. The server validates the WHOLE
+optional login-page blurb and user-agreement document, the optional copyright
+line, and brand logos for the WebUI entries, per locale. The server validates the WHOLE
 bundle at startup and atomically activates it as an immutable in-memory
 snapshot; request handling never touches the disk again.
 
@@ -41,6 +41,11 @@ MAX_TEMPLATE_BYTES = 64 * 1024  # per Markdown template file
 MAX_LOGO_BYTES = 2 * 1024 * 1024  # per logo file
 
 BRAND_LOGO_ASSET_ID = "brand-logo"
+
+# The one file whose presence means "this directory holds a bundle". A
+# configured directory without it is an unpopulated mount point, not a broken
+# bundle — see resolve_ui_customization_snapshot.
+BUNDLE_MANIFEST_NAME = "manifest.json"
 
 # Right-to-left writing systems, DERIVED from CLDR 48 (Unicode
 # 16.0.0) rather than curated by hand — the previous four-language
@@ -93,6 +98,9 @@ _REQUIRED_LOCALE_FIELDS = ("welcome", "query_empty")
 # UILocaleContent.consent_required: the login-page consent gate turns on only
 # when a locale declares BOTH of them.
 _OPTIONAL_LOCALE_TEMPLATE_FIELDS = ("login", "agreements")
+# Inline (non-path) strings a locale MAY declare, validated like `logo_alt`:
+# present means a non-empty string, absent or explicit null means undeclared.
+_OPTIONAL_LOCALE_TEXT_FIELDS = ("consent_documents",)
 
 
 class UICustomizationError(Exception):
@@ -512,6 +520,20 @@ class UILocaleContent:
     # single link, so a reader opens and scrolls one document instead of
     # hunting for a second one they are equally required to have read.
     agreements: str | None = None
+    # How the consent checkbox NAMES the agreement document in its link --
+    # deployment content, so it belongs to the bundle beside the document it
+    # names, not to the WebUI's own translations (which cannot know that a
+    # deployment calls its document "Terms of Service"). None means the
+    # bundle declares no name and the WebUI falls back to its translated
+    # default; it is NOT part of `consent_required`, because a missing NAME
+    # never justifies dropping a gate whose document is right there.
+    consent_documents: str | None = None
+    # The deployment's own copyright line, shown at the foot of the pre-login
+    # pages. Inline manifest text rather than a template file: it is one short
+    # line, and a bundle that says nothing about copyright must produce no
+    # line at all -- LightRAG never asserts a customer's copyright, and never
+    # asserts its own on a customer's page.
+    copyright: str | None = None
 
     @property
     def consent_required(self) -> bool:
@@ -599,6 +621,29 @@ def _validate_keys(obj: dict, allowed: set[str], required: set[str], context: st
         raise _fail(f"{context}: missing required field(s) {sorted(missing)}")
 
 
+def _read_copyright(raw: object, context: str) -> str | None:
+    """A manifest copyright value, normalized to text or None.
+
+    Handled here rather than through ``_OPTIONAL_LOCALE_TEXT_FIELDS``, whose
+    two rules this field deliberately breaks: it inherits a brand-level
+    default when the locale omits it, and it accepts blank (see below) where
+    that loop refuses it.
+
+    Blank is NOT rejected the way a blank ``login``/``agreements`` template is:
+    there, declared-or-not is itself the switch that puts a consent gate in
+    front of the user, so an empty file is a misconfiguration worth failing
+    startup over. Here blankness only turns the line OFF, which is the same
+    end state as omitting the field and the same one an uncustomized
+    deployment is in -- nothing is silently mis-shown, so refusing to start
+    would cost a deployment more than it protects it.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise _fail(f"{context} must be a string or null")
+    return raw.strip() or None
+
+
 def load_ui_customization_snapshot(bundle_dir: str | Path) -> UICustomizationSnapshot:
     """Validate the WHOLE bundle and build the immutable snapshot.
 
@@ -613,7 +658,7 @@ def load_ui_customization_snapshot(bundle_dir: str | Path) -> UICustomizationSna
     if not root.is_dir():
         raise _fail(f"directory {str(root)!r} does not exist or is not a directory")
 
-    manifest_path = root / "manifest.json"
+    manifest_path = root / BUNDLE_MANIFEST_NAME
     if not manifest_path.is_file():
         raise _fail("manifest.json is missing")
     manifest_bytes = _read_limited(manifest_path, MAX_TEMPLATE_BYTES, "manifest.json")
@@ -643,10 +688,20 @@ def load_ui_customization_snapshot(bundle_dir: str | Path) -> UICustomizationSna
     # bundle shows no logo"). Omission used to silently fall back to the
     # LightRAG logo — customer texts with the wrong logo is a worse branding
     # accident than a missing one, so the schema makes the gap inexpressible.
-    _validate_keys(brand, allowed={"logo"}, required={"logo"}, context="brand")
+    _validate_keys(
+        brand,
+        allowed={"logo", "copyright"},
+        required={"logo"},
+        context="brand",
+    )
     brand_logo_rel = brand["logo"]
     if brand_logo_rel is not None and not isinstance(brand_logo_rel, str):
         raise _fail("brand.logo must be a path string or an explicit null")
+    # Unlike brand.logo, copyright is OPTIONAL to declare: its omission has
+    # exactly one reading -- no copyright line -- and that is also what an
+    # uncustomized deployment shows, so there is no wrong-content accident for
+    # the schema to make inexpressible.
+    brand_copyright = _read_copyright(brand.get("copyright"), "brand.copyright")
 
     # --- locales ---------------------------------------------------------
     raw_locales = manifest["locales"]
@@ -704,7 +759,9 @@ def load_ui_customization_snapshot(bundle_dir: str | Path) -> UICustomizationSna
                 "query_empty",
                 "logo_alt",
                 "logo",
+                "copyright",
                 *_OPTIONAL_LOCALE_TEMPLATE_FIELDS,
+                *_OPTIONAL_LOCALE_TEXT_FIELDS,
             },
             required={*_REQUIRED_LOCALE_FIELDS, "logo_alt"},
             context=f"locales.{key}",
@@ -743,6 +800,21 @@ def load_ui_customization_snapshot(bundle_dir: str | Path) -> UICustomizationSna
             else:
                 raise _fail(f"{context} must be a path string or null")
 
+        # Inline strings. Declared-but-blank is rejected for the same reason
+        # a blank template is: an empty link label would leave the consent
+        # checkbox pointing at a document with no name.
+        optional_texts: dict[str, str | None] = {}
+        for field_name in _OPTIONAL_LOCALE_TEXT_FIELDS:
+            raw_value = entry.get(field_name)
+            if raw_value is None:
+                optional_texts[field_name] = None
+            elif isinstance(raw_value, str) and raw_value.strip():
+                optional_texts[field_name] = raw_value
+            else:
+                raise _fail(
+                    f"locales.{key}.{field_name} must be a non-empty string or null"
+                )
+
         logo_asset_id: str | None
         if "logo" in entry:
             locale_logo_rel = entry["logo"]
@@ -759,12 +831,24 @@ def load_ui_customization_snapshot(bundle_dir: str | Path) -> UICustomizationSna
                 brand_logo_asset.asset_id if brand_logo_asset is not None else None
             )
 
+        # Same override shape as `logo`: the brand-level value is the default
+        # for every locale, a locale may replace it, and an explicit null
+        # means "no copyright line for this locale" rather than "inherit".
+        if "copyright" in entry:
+            locale_copyright = _read_copyright(
+                entry["copyright"], f"locales.{key}.copyright"
+            )
+        else:
+            locale_copyright = brand_copyright
+
         locales[key] = UILocaleContent(
             welcome=welcome,
             query_empty=query_empty,
             logo_alt=logo_alt,
             logo_asset_id=logo_asset_id,
+            copyright=locale_copyright,
             **optional_templates,
+            **optional_texts,
         )
 
     # --- default locale ----------------------------------------------------
@@ -826,3 +910,51 @@ def load_ui_customization_snapshot(bundle_dir: str | Path) -> UICustomizationSna
         assets=assets,
         bundle_revision=bundle_revision,
     )
+
+
+def resolve_ui_customization_snapshot(
+    bundle_dir: str | Path,
+) -> UICustomizationSnapshot | None:
+    """Resolve a CONFIGURED ``UI_TEMPLATES_DIR`` into a snapshot, or ``None``.
+
+    Three states, deliberately kept distinct:
+
+    - **directory missing** → :class:`UICustomizationError`. Pointing the
+      variable at nothing is a configuration error, and no deployment shape
+      produces it by accident: a compose bind mount materializes both ends
+      before the container starts, so this only ever fires on a typo.
+    - **directory present, no ``manifest.json``** → ``None`` plus a caller-side
+      warning. This is an unpopulated mount point — the state every default
+      Docker deployment starts in, because the compose file mounts
+      ``./data/ui_templates`` and sets the variable unconditionally so that
+      dropping a bundle in and restarting is the whole activation procedure.
+      Failing here would make the shipped compose files refuse to boot.
+      Only a genuinely ABSENT path counts: a ``manifest.json`` that exists as
+      a directory, a dangling symlink or any other non-regular file is an
+      anomaly, not an empty mount point, and it raises rather than degrading
+      to the built-in branding.
+    - **``manifest.json`` present** → full validation, unchanged. Fail-fast
+      still owns everything from here on: a partial, corrupt or half-copied
+      bundle refuses startup rather than silently serving LightRAG content to
+      an operator who believes their branding is live.
+
+    Emptiness is deliberately NOT judged by "the directory has no entries":
+    a stray ``.DS_Store`` or ``.gitkeep`` — which macOS and git produce
+    unbidden in exactly this directory — would then flip a working deployment
+    into a boot loop. The manifest is the bundle's own entry point, so its
+    absence is the honest test for "nothing to load yet".
+    """
+    root = Path(bundle_dir)
+    if not root.is_dir():
+        raise _fail(f"directory {str(root)!r} does not exist or is not a directory")
+    manifest_path = root / BUNDLE_MANIFEST_NAME
+    if not manifest_path.is_file():
+        # exists() follows symlinks, so a dangling one needs is_symlink() to be
+        # told apart from nothing being there at all.
+        if manifest_path.exists() or manifest_path.is_symlink():
+            raise _fail(
+                f"{BUNDLE_MANIFEST_NAME} exists but is not a readable regular "
+                "file (a directory, a broken symlink or similar)"
+            )
+        return None
+    return load_ui_customization_snapshot(root)

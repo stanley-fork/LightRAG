@@ -35,8 +35,28 @@ export interface CustomizedContent {
   brandTitle: string
   /** Login-page blurb; empty when the bundle declares none (or no bundle). */
   loginMarkdown: string
+  /**
+   * The bundle's copyright line, or '' when there is none to show.
+   *
+   * Unlike every other field here, this one has NO frontend default: an
+   * uncustomized deployment renders no copyright line at all, so the
+   * default-content branch below returns '' rather than a translated string.
+   * The line is the deployment's own legal assertion — LightRAG neither
+   * invents one for a customer nor prints its own on a customer's page.
+   */
+  copyright: string
   /** The single user-agreement document, or null when none is declared. */
   agreementsMarkdown: string | null
+  /**
+   * How the consent checkbox names its link, as declared by the bundle
+   * (`locales.<locale>.consent_documents`), or null when it declares none.
+   *
+   * Left as null rather than resolved to the WebUI's translated default
+   * HERE: the fallback belongs to the page that renders the label, so this
+   * hook keeps reporting exactly what the bundle said — the same rule the
+   * other bundle fields follow.
+   */
+  consentDocuments: string | null
   /**
    * Whether the login page must gate submission behind the consent checkbox.
    * Comes STRAIGHT from the server's `consent_required` — this hook never
@@ -119,6 +139,8 @@ export function useCustomizedContent(
       brandTitle: '',
       loginMarkdown: '',
       agreementsMarkdown: null,
+      consentDocuments: null,
+      copyright: '',
       consentRequired: false,
       consentPending: true
     }
@@ -137,6 +159,11 @@ export function useCustomizedContent(
       brandTitle: resolveBrandTitle(snapshot.brand.title, authStatusTitle),
       loginMarkdown: snapshot.login?.content ?? '',
       agreementsMarkdown: snapshot.agreements?.content ?? null,
+      consentDocuments: snapshot.consent_documents ?? null,
+      // Trimmed here so a bundle whose copyright is whitespace renders
+      // nothing, exactly as an omitted one does — the server normalizes the
+      // same way, and the page's own guard is then a single emptiness test.
+      copyright: snapshot.brand.copyright?.trim() ?? '',
       consentRequired: snapshot.consent_required === true,
       consentPending
     }
@@ -158,6 +185,9 @@ export function useCustomizedContent(
     // branding endpoint is unreachable would lock out the deployment.
     loginMarkdown: '',
     agreementsMarkdown: null,
+    consentDocuments: null,
+    // No bundle, or a hard failure: nothing asserts a copyright, so no line.
+    copyright: '',
     consentRequired: false,
     consentPending
   }
