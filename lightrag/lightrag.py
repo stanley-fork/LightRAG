@@ -6541,6 +6541,8 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             self.entities_vdb,
             self.relationships_vdb,
             entity_name,
+            entity_chunks_storage=self.entity_chunks,
+            relation_chunks_storage=self.relation_chunks,
         )
 
     def delete_by_entity(self, entity_name: str) -> DeletionResult:
@@ -6580,6 +6582,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             self.relationships_vdb,
             source_entity,
             target_entity,
+            relation_chunks_storage=self.relation_chunks,
         )
 
     def delete_by_relation(
