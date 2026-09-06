@@ -5174,14 +5174,14 @@ async def use_llm_func_with_cache(
     This function applies text sanitization to prevent UTF-8 encoding errors for all LLM providers.
 
     Args:
-        input_text: Input text to send to LLM
+        user_prompt: Input text to send to LLM
         use_llm_func: LLM function with higher priority
         llm_response_cache: Cache storage instance
         max_tokens: Maximum tokens for generation
         history_messages: History messages list
         cache_type: Type of cache
         chunk_id: Chunk identifier to store in cache
-        text_chunks_storage: Text chunks storage to update llm_cache_list
+        system_prompt: Optional system prompt sent alongside the user prompt
         cache_keys_collector: Optional list to collect cache keys for batch processing
         response_format: Structured output control forwarded to the LLM provider.
             Providers translate this to their native structured-output surface
@@ -5371,13 +5371,18 @@ def get_content_summary(content: str, max_length: int = 250) -> str:
 def sanitize_and_normalize_extracted_text(
     input_text: str, remove_inner_quotes=False
 ) -> str:
-    """Santitize and normalize extracted text
+    """Sanitize and normalize extracted text
+
     Args:
         input_text: text string to be processed
-        is_name: whether the input text is a entity or relation name
+        remove_inner_quotes: whether to remove Chinese quotation marks and
+            English quotation marks adjacent to Chinese characters, and to
+            normalize non-breaking spaces. Matching outer quotation marks are
+            removed independently of this option only when the enclosed text
+            contains no corresponding quote characters.
 
     Returns:
-        Santitized and normalized text string
+        Sanitized and normalized text string
     """
     safe_input_text = sanitize_text_for_encoding(input_text)
     if safe_input_text:
@@ -5402,19 +5407,21 @@ def normalize_extracted_info(name: str, remove_inner_quotes=False) -> str:
     - Preserve spaces within English text and numbers
     - Replace Chinese parentheses with English parentheses
     - Replace Chinese dash with English dash
-    - Remove English quotation marks from the beginning and end of the text
-    - Remove English quotation marks in and around chinese
-    - Remove Chinese quotation marks
+    - Remove a matching outer English/Chinese quote or book title mark pair only
+      when the enclosed text contains no corresponding mark characters
     - Filter out short numeric-only text (length < 3 and only digits/dots)
     - remove_inner_quotes = True
-        remove Chinese quotes
-        remove English quotes in and around chinese
-        Convert non-breaking spaces to regular spaces
-        Convert narrow non-breaking spaces after non-digits to regular spaces
+        - Remove Chinese quotation marks
+        - Remove English quotation marks adjacent to Chinese characters
+        - Convert non-breaking spaces to regular spaces
+        - Convert narrow non-breaking spaces after non-digits to regular spaces
 
     Args:
         name: Entity name to normalize
-        is_entity: Whether this is an entity name (affects quote handling)
+        remove_inner_quotes: whether to apply the optional quote and
+            non-breaking-space rules above. Matching outer quotation marks are
+            removed independently of this option only when the enclosed text
+            contains no corresponding quote characters.
 
     Returns:
         Normalized entity name
@@ -5526,7 +5533,9 @@ def normalize_extracted_info(name: str, remove_inner_quotes=False) -> str:
     return name
 
 
-def sanitize_text_for_encoding(text: str, replacement_char: str = "") -> str:
+def sanitize_text_for_encoding(
+    text: str, replacement_char: str = "", *, strip: bool = True
+) -> str:
     """Sanitize text to ensure safe UTF-8 encoding by removing or replacing problematic characters.
 
     This function handles:
@@ -5535,11 +5544,19 @@ def sanitize_text_for_encoding(text: str, replacement_char: str = "") -> str:
     - Control characters that might cause issues
     - Unescape HTML escapes
     - Remove control characters
-    - Whitespace trimming
+    - Whitespace trimming (see ``strip``)
 
     Args:
         text: Input text to sanitize
         replacement_char: Character to use for replacing invalid sequences
+        strip: Trim leading/trailing whitespace. Default ``True``, which is
+            what every caller sanitizing a whole payload wants. Pass ``False``
+            when the text is a FRAGMENT that will sit inside a larger
+            sanitized string: its boundary whitespace is interior to that
+            string and survives there, so trimming the fragment in isolation
+            would produce something the consumer of the larger string never
+            saw. ``kg_extraction_validator`` is the case in point — the chunk
+            sits inside a fenced ``---Input Text---`` section of the prompt.
 
     Returns:
         Sanitized text that can be safely encoded as UTF-8
@@ -5548,7 +5565,8 @@ def sanitize_text_for_encoding(text: str, replacement_char: str = "") -> str:
         return text
 
     # First, strip whitespace
-    text = text.strip()
+    if strip:
+        text = text.strip()
 
     # Early return if text is empty after basic cleaning
     if not text:
@@ -5564,7 +5582,7 @@ def sanitize_text_for_encoding(text: str, replacement_char: str = "") -> str:
     # 3. Remove control characters but preserve common whitespace (\t, \n, \r)
     text = _CONTROL_CHAR_PATTERN_ALL.sub(replacement_char, text)
 
-    return text.strip()
+    return text.strip() if strip else text
 
 
 def strip_control_characters(text: str, replacement_char: str = "") -> str:
