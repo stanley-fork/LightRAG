@@ -1662,27 +1662,56 @@ What that can leave behind, and why it is tolerated:
   fails, the edit is already durable and the row keeps naming a chunk the
   relation no longer cites — under-deletion, the accepted direction, repaired by
   the [chunk-tracking repair](#repairing-chunk-tracking). The accepted *state*
-  does not make it a silent one: the failure raises
+  does not make it a silent one: a failure of that last step raises
   `VectorStorageConsistencyError` (a 500 naming the row and the repair tool),
   because a retry cannot heal it — the second edit sees an unchanged `source_id`
   and skips the tracking update — so the operator is the only recovery path, and
   a 200 would guarantee they never learn to take it.
-- **Accepted residue, not yet closed: `aedit_entity`'s non-rename path.** It
-  still commits the graph *before* flushing the tracking row, so a hard process
-  exit in that window leaves a **growing** edit — one that adds evidence IDs —
-  with the node on disk citing chunks its row does not yet name. That is the
-  `rows ⊂ graph` direction, the one this codebase does **not** accept: a later
-  purge of a document naming only the older chunks reads the row, concludes "no
-  remaining sources" and deletes an entity the added chunk still anchors. It is
-  reachable from `POST /graph/entity/edit`, whose `updated_data` accepts
-  `source_id`. It is a pre-existing gap rather than a new one — the rename
-  branch of the same function already stages its rows ahead of the commit (see
-  the [merge and rename failure model](design/PurgeRecoveryContract.md#merge-and-rename-failure-model))
-  — and closing it wants the same grow-then-shrink staging as `aedit_relation`,
-  applied without disturbing the rename branch's opposite, deliberate ordering
-  (issue #3609). Until then the recovery for an affected row is the
-  [chunk-tracking repair](#repairing-chunk-tracking), and a growing entity edit
-  should not be issued concurrently with, or shortly before, a document purge.
+  Both ways that last step could be *skipped* rather than fail are closed
+  (issue #3895): it runs *inside* a cancellation-deferring region alongside the
+  graph commit, so a cancellation deferred through that commit cannot walk past
+  it, and *before* the relation's vector work, so no vector failure can strand
+  it. The reverse exposure is the acceptable one — a shrink failure skips the
+  vector write, leaving records a re-issued edit rewrites and
+  `lightrag-rebuild-vdb` restores, and the message names both. A declined graph
+  commit still outranks a vector failure, because the commit is confirmed on its
+  own before any vector call is made.
+  **One residue stays open, deliberately, the same one the entity path carries
+  below:** a cancellation — or an ordinary error, an acknowledgement lost after
+  the fact carries the same ambiguity — delivered inside `upsert_edge`'s own
+  await tears the edit down before the shrink, so the edge may be narrowed while
+  the row keeps the superset. It cannot be deferred (the exception originates in
+  that coroutine) and must not be settled blind (narrowing a row whose write the
+  backend never accepted is the over-deleting mirror), so the row stays wide and
+  the failure is *logged* with the row key and the repair tool.
+- `aedit_entity`'s non-rename path stages its row the same way, for the same
+  reason: a **growing** edit there used to commit the node before flushing the
+  row that attributes it, leaving `rows ⊂ graph` — reachable from `POST
+  /graph/entity/edit`, whose `updated_data` accepts `source_id`. The superset
+  row is now durable before `upsert_node` is called at all, and the removals are
+  applied after the graph commit. Its shrink is staged exactly like the relation
+  one's: it runs *inside* the cancellation-deferring region and *before* the
+  vector write, so neither a cancellation nor a vector failure can skip it. It
+  either completes or raises with the row key and the repair tool named.
+  **One residue there stays open, deliberately:** a cancellation delivered
+  *inside* `upsert_node`'s own await — after an immediate-write backend accepted
+  the row, before control returns — tears the edit down before the shrink, so
+  the node is narrowed while the row keeps the superset. It cannot be deferred
+  (the `CancelledError` originates in that coroutine, so there is nothing for
+  `_finish_deferring_cancellation` to defer, and issuing the call from inside
+  that region gives the identical residue), and it must not be settled blind:
+  whether the backend accepted the write is unknowable there, and narrowing the
+  row when it did not would leave `rows ⊂ graph` — over-deletion, which this
+  ranking treats as losing data, traded against a residue that merely retains a
+  chunk ID. So the row stays wide and the failure is *logged* with the row key
+  and the repair tool, which is the part that was actually owed — for an
+  ordinary backend error as much as for a cancellation, since an
+  acknowledgement lost after the write was applied carries the same ambiguity
+  and the caller's error says only that the write failed. Its
+  **rename** path needs no such staging and deliberately keeps its own ordering:
+  it writes a fresh node whose `source_id` already equals the row it migrates,
+  and it retires the old key only after the commit that removes the old node
+  (see the [merge and rename failure model](design/PurgeRecoveryContract.md#merge-and-rename-failure-model)).
 - A graph backend that *declines* its commit (the NetworkX reload fence) raises
   out of the create, edit, merge and delete paths alike, so the caller sees a
   500 instead of a success for a write that was discarded.
