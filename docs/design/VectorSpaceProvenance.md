@@ -98,6 +98,47 @@ payload that cannot be parsed reads as absent for the same reason.
 The direct consequence is that silence never ends by itself, which is why an
 unmarked container has to be *adopted* — see the transition below.
 
+**Nothing but adoption may end the silence**, and that includes the write path.
+A backend that records its marker when it *saves* is performing a backfill just
+as surely as one that records it on attach, and a worse one: the rows it stamps
+are mostly rows a previous model wrote. So a save may record the marker only
+over a container this process can vouch for — one that was **empty** when this
+process attached (every row since is one it wrote), or one that **already names
+a model**, which the attach check has just confirmed is ours. A non-empty
+container recording no model stays unmarked no matter how much is written to it,
+until `drop()` empties it or the adoption probe certifies it. Getting this wrong
+does not merely miss a detection: it records a false marker that every later
+start believes, and that the adoption probe then sees no conflict in.
+
+The same rule closes a second door: a process whose `embedding_func` has no
+`model_name` is *accepted* against a marked container (it cannot contradict the
+name), but it may not certify one either. If it did, its next save would replace
+a payload naming a model with a dimension-only payload — erasing provenance that
+was already established and reopening the very same-dimension swap the name was
+recorded to catch. Certification needs **both** sides named; attach needs
+neither.
+
+### The server refuses to start unnamed
+
+The library keeps working without `model_name` — and `lightrag-rebuild-vdb`
+must, because it is the way out of a refusal. The **server** does not: it
+refuses to start when `EMBEDDING_MODEL` is unset, empty, or whitespace.
+
+A server with no name to record provisions containers that are unprotected for
+life, and the rule above means that silence never ends on its own. There is also
+no in-place way to fix it later: LightRAG propagates no configuration between
+worker processes and supports no rolling update, so an embedding-model change is
+always stop → `lightrag-rebuild-vdb` → start. A deployment that cannot say which
+model wrote its vectors has no safe path through that sequence, and the failure
+it is heading for is not an error — it is confidently wrong neighbours, returned
+silently.
+
+The refusal names `EMBEDDING_MODEL`, `lightrag-rebuild-vdb`, and why rolling is
+not an option, because an operator who hits it at startup is exactly the
+operator who needs all three. An `args` object that never carried the field is
+refused the same way: a safety guard exempting "the attribute was never set" is
+a guard with a bypass.
+
 ## Where the marker lives: never in the data plane
 
 A marker must not be an ordinary vector record. The rule and the reason:
@@ -111,7 +152,7 @@ A marker must not be an ordinary vector record. The rule and the reason:
 | OpenSearch | index mapping `_meta`, beside the existing workspace identity | not a document |
 | MongoDB | the collection's JSON Schema validator `description` | not a document |
 | Nano | `additional_data` in the vdb JSON file | not a row in `data` / `matrix`; `query()` cannot see it |
-| FAISS | a reserved key in the `.meta.json` sidecar | not in the `.index` file, so `index.search()` cannot return it |
+| FAISS | a `<index>.space.json` sidecar file | not in the `.index` file, so `index.search()` cannot return it |
 | Milvus, Qdrant, PostgreSQL | none — the container name is the provenance | nothing is stored |
 
 Three approaches were considered and rejected:
@@ -132,6 +173,28 @@ Three approaches were considered and rejected:
   path, and every other read filters by `_id` / `src_id` / `tgt_id`), but it puts
   a row in the data collection and makes every future full-collection scan owe it
   an exclusion. The validator `description` is metadata and owes nothing.
+
+FAISS is the one backend whose marker does **not** ride in a file the storage
+already writes, and the reason is downgrade safety. Its `.meta.json` is
+`{str(faiss_id): metadata}`, `_load_faiss_index` calls `int()` on every key, and
+its `except Exception` falls back to "start with an empty index". An older
+LightRAG reading a reserved key would therefore discard every metadata row, and
+the next save would persist that emptiness — silent total loss of the store on a
+rollback. A file an old reader never opens cannot do that.
+
+The sidecar is deliberately **not** part of `_fingerprint_paths`: it carries no
+rows, so a peer has nothing to reload because of it, and a third path would
+change the two-file publication fence. It is written *before* the fenced pair,
+so the metadata rename stays the last thing that happens — that rename is the
+storage's commit point, and a third write after it would make a complete
+publication look torn. Accepted residue: a crash between the marker write and
+the pair leaves a marker describing rows that were not written. The marker only
+changes when the operator changes the embedding configuration, and that is
+exactly when the store is rebuilt anyway.
+
+Nano needs none of this: `additional_data` is a key `NanoVectorDB` itself
+round-trips through the same JSON object as the rows, so the marker is published
+by the same atomic rename, and an older reader preserves and ignores it.
 
 Two things the Mongo validator home requires, both easy to get wrong:
 
@@ -167,6 +230,54 @@ Two rules bind every raiser:
    connection or its flush lock is *wedged*, not fail-closed — the operator then
    has to delete the container out of band, which is the defect this work
    removes.
+
+### The named-container backends' refusal
+
+Milvus, Qdrant and PostgreSQL record no marker, but they each already compare
+the *dimension* of a container they are about to read against the one they are
+configured with. That comparison is the same refusal, so it raises the same
+type — and the two raiser rules apply to it unchanged.
+
+Four things that were wrong before and are now part of the contract:
+
+- **It is `VectorSpaceMismatchError`, not `DataMigrationError`.** Nothing is
+  being migrated when it fires; the container is simply in another embedding
+  space. Milvus additionally must not let `_validate_collection_and_load`
+  reframe it as the generic "manual intervention required" `RuntimeError`,
+  which is indistinguishable from a corrupt schema.
+- **A refused instance stays droppable.** Qdrant and PostgreSQL assigned
+  `_flush_lock` after the step that refuses, so `drop()` then died on
+  `async with None` — the OpenSearch bug again. Both now take the lock before
+  anything that can refuse, and `drop()` tolerates a container that does not
+  exist, because the refusal is raised *before* the new collection or table is
+  created.
+- **A missing dimension on either side is a schema error, not the refusal.**
+  *Absent evidence never refuses* binds the dimension comparison exactly as it
+  binds the marker. `None != 768` reads as a mismatch, and the tool answers a
+  mismatch by dropping the container — so a malformed `describe_collection`
+  response, or an `embedding_func` that never declared a dimension, would
+  authorise destroying live vectors over a fact nobody reported. Milvus checks
+  both sides before comparing and raises a plain, non-droppable `ValueError` on
+  either. PostgreSQL raises the same error for an undeclared dimension at the
+  top of `setup_table()` rather than at the comparison, because that check sits
+  inside a `try` whose `except Exception` reframes everything it catches as
+  `DataMigrationError`; a *legacy* dimension it could not read is simply not
+  compared, and the migration that follows fails closed at insert — the
+  acceptable direction, since nothing is dropped.
+- **The refusal is scoped to what THIS workspace would migrate.** Qdrant's
+  legacy collection can be shared across tenants, and its gate counted every
+  tenant's points. That refused a workspace with nothing to migrate, and the
+  refusal could not be cleared: `drop()` only ever removes this workspace's
+  legacy points, so the next `initialize()` refused again — wedged, not
+  fail-closed. It now counts the legacy points this workspace would actually
+  migrate (all of them when the collection is untagged, which is exactly what
+  the migration below reads), so `drop()` → `initialize()` converges.
+
+A Milvus *legacy* collection in another embedding space is deliberately NOT a
+refusal: the suffixed collection does not exist yet, so nothing is being served
+out of the wrong space. The legacy collection is only a migration source, and an
+incompatible source is skipped. That case is the empty-container gate's, not
+this one's.
 
 ## The recovery protocol
 
@@ -329,7 +440,7 @@ Each row lands with its own change; a row is only true once that change is in.
 | change | backend | work |
 | --- | --- | --- |
 | PR 2 | OpenSearch | marker in `_meta`; drop-capable while refused; fix the lost-`indices.create`-race attach that validates ownership but not compatibility |
-| PR 3 | MongoDB | marker in the JSON Schema validator `description`; `drop()` must drop and recreate the Atlas search index, and rewrite the description |
-| PR 4 / 5 | FAISS, Nano | marker in `.meta.json` / `additional_data`; move the refusal out of `__post_init__` so the object survives it and stays droppable |
-| PR 6 / 7 / 8 | Milvus, Qdrant, PostgreSQL | no marker. Replace the legacy-path `DataMigrationError` with the typed refusal so the tool can tolerate it, and make a refused instance drop-capable (Qdrant assigns `_flush_lock` *after* its init block, the same shape as the OpenSearch bug) |
+| PR 3 | MongoDB | marker in the JSON Schema validator `description`; `drop()` must rewrite that description and rebuild the Atlas search index when the DIMENSION changed (the index definition records a dimension and nothing else, so a same-dimension model change leaves a usable index) |
+| PR 4 / 5 | FAISS, Nano | marker in a `.space.json` sidecar / `additional_data`; move the refusal out of `__post_init__` so the object survives it and stays droppable |
+| PR 6 / 7 / 8 | Milvus, Qdrant, PostgreSQL | no marker. Replace the legacy-path `DataMigrationError` with the typed refusal so the tool can tolerate it, and make a refused instance drop-capable (Qdrant and PostgreSQL assign `_flush_lock` *after* their init block, the same shape as the OpenSearch bug) — see *The named-container backends' refusal* |
 | gate | — | the empty-container gate and the adoption probe in `LightRAG.initialize_storages()` |
