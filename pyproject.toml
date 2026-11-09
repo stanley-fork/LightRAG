@@ -134,10 +134,24 @@ api = [
     # (sentence/NER heuristics). Language models are separate wheels pinned in
     # requirements-offline-smart-heading.txt and installed via
     # `lightrag-download-cache --spacy-install`.
-    # 3.8.14 and 3.8.15 shipped neither a cp314 wheel nor an sdist, breaking
-    # `uv sync --frozen` on Python 3.14; 3.8.16 restored both. Cap below
-    # 3.8.17 to stay on 3.8.x until spacy 4.x graduates from dev.
-    "spacy>=3.8,<3.8.17",
+    # Capped at the minor version: spaCy models are trained per minor release
+    # and the pinned 3.8.0 models declare spacy_version ">=3.8.0,<3.9.0" in
+    # meta.json only (not in Requires-Dist), so nothing would stop a 3.9
+    # upgrade from silently changing NER / sentence-split decisions. Moving to
+    # 3.9 means swapping the model URLs in requirements-offline-smart-heading.txt
+    # and re-validating smart_heading. Patch releases are vetted by uv.lock:
+    # 3.8.14 and 3.8.15 shipped neither a cp314 wheel nor an sdist, which the
+    # CI Python 3.14 leg's `uv sync --locked` catches at lock-update time.
+    "spacy>=3.8,<3.9",
+    # zh_core_web_sm's tokenizer backend (the model wheel requires it but does
+    # not bundle it). Declared here so uv.lock and `uv sync` own it instead of
+    # leaving it unmanaged next to the model wheels. Exact pin, like the
+    # models: it does the Chinese word segmentation smart_heading's
+    # determinism promise rests on, and the pip-only offline path
+    # (requirements-offline-smart-heading.txt) does not go through uv.lock.
+    # SPACY_MODEL_WHEELS in lightrag/tools/download_cache.py carries the same
+    # pin; tests/test_requirements_sync.py keeps all copies equal.
+    "spacy-pkuseg==1.0.2",
 ]
 
 # Offline deployment dependencies (layered design for flexibility)
