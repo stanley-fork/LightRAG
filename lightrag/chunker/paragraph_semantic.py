@@ -333,7 +333,7 @@ def _load_table_headers(blocks_path: str) -> dict[str, str]:
     try:
         with Path(path).open("r", encoding="utf-8") as fh:
             data = json.load(fh)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
     tables = data.get("tables") if isinstance(data, dict) else None
     if not isinstance(tables, dict):
@@ -2195,7 +2195,9 @@ def chunking_by_paragraph_semantic(
     else:
         try:
             rows = _load_blocks_from_jsonl(blocks_path)
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
+            # UnicodeDecodeError is a ValueError, not an OSError: a sidecar
+            # holding invalid UTF-8 is as unreadable as a missing one.
             fallback_reason = f"cannot read blocks.jsonl at {blocks_path}: {exc}"
         else:
             if not rows:

@@ -363,6 +363,15 @@ See `env.example` for comprehensive template.
 ### Language
 Comments, backend code, log messages, and Git commit messages in English. Frontend uses i18next for multi-language support.
 
+### README translations
+
+`README.md` has three translations: `README-zh.md`, `README-ja.md` and `README-id.md`. All four are kept **line-for-line aligned**:
+
+- **A change to any README goes into all four in the same commit.** Never leave a translation for later. Changes that reached `README.md` alone are how the translations drifted before: they were missing a banner, a documentation table row, renamed env vars and whole paragraphs, and their line counts had drifted apart.
+- **Same line count, same structure.** Line N plays the same role in every file: a heading of the same level, a list item, a table row, a code fence, an HTML line, or a blank line. Keep the English line breaks. A two-line code comment stays two lines, and a bullet list does not become a numbered one.
+- **Translate the prose only.** Code, commands, env var names, file paths and anchors stay identical. Link targets do too, except that `README-zh.md` may point at a `*-zh.md` translation of the linked doc.
+- **Enforced by `tests/test_readme_translations.py`**, which is offline and runs in CI. It fails on a line-count mismatch and on the first line whose kind differs, and names that line in all files. Run it after any README edit: `./scripts/test.sh tests/test_readme_translations.py`. A new translation must be added to its `test_translations_exist` list and to this section.
+
 ### Docstrings and comments
 
 Docstrings state the **rules**: what a caller must do, what it must not do, and the gotchas it will otherwise be caught by. The **mechanism** — how it works, the accepted residues, and the alternatives already rejected — goes in `docs/design/` with a pointer from the docstring. A docstring that has grown into a design document is the thing this separates: it buries the code, and the same facts in two places drift apart.
