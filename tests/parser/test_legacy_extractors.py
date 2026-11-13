@@ -7,6 +7,9 @@ from zipfile import ZIP_DEFLATED, ZipFile
 from xml.etree import ElementTree as ET
 
 import pytest
+from docx import Document
+from docx.oxml.shared import OxmlElement
+from docx.oxml.ns import qn
 from openpyxl import Workbook
 from pptx import Presentation
 from pptx.enum.shapes import MSO_CONNECTOR
@@ -252,6 +255,118 @@ def test_extract_text_pptx_preserves_grouped_text_and_order(group_depth):
         "Before\nGrouped paragraph\nSecond paragraph\vSoft break\n\n"
         "Group sibling\nAfter\nNext slide\n"
     )
+
+
+def _docx_bytes(document) -> bytes:
+    file_bytes = BytesIO()
+    document.save(file_bytes)
+    return file_bytes.getvalue()
+
+
+@pytest.mark.offline
+def test_extract_text_docx_keeps_horizontally_merged_cell_text_once():
+    document = Document()
+    table = document.add_table(rows=2, cols=3)
+    table.cell(0, 0).merge(table.cell(0, 2)).text = "Quarterly report"
+    for column, text in enumerate(("Q1", "Q2", "Q3")):
+        table.cell(1, column).text = text
+
+    # The merged cell still takes three columns, so the rows stay aligned.
+    assert extract_text(_docx_bytes(document), "docx") == (
+        "Quarterly report\t\t\nQ1\tQ2\tQ3"
+    )
+
+
+@pytest.mark.offline
+def test_extract_text_docx_repeats_vertically_merged_cell_text_per_row():
+    document = Document()
+    table = document.add_table(rows=2, cols=2)
+    table.cell(0, 0).merge(table.cell(1, 0)).text = "Region"
+    table.cell(0, 1).text = "North"
+    table.cell(1, 1).text = "South"
+
+    assert extract_text(_docx_bytes(document), "docx") == (
+        "Region\tNorth\nRegion\tSouth"
+    )
+
+
+@pytest.mark.offline
+def test_extract_text_docx_block_merged_cell_text_is_once_per_row():
+    document = Document()
+    table = document.add_table(rows=2, cols=3)
+    table.cell(0, 0).merge(table.cell(1, 1)).text = "Block"
+    table.cell(0, 2).text = "A"
+    table.cell(1, 2).text = "B"
+
+    assert extract_text(_docx_bytes(document), "docx") == "Block\t\tA\nBlock\t\tB"
+
+
+def _filled_table(document, rows: int, cols: int):
+    table = document.add_table(rows=rows, cols=cols)
+    for row in range(rows):
+        for column in range(cols):
+            table.cell(row, column).text = f"r{row}c{column}"
+    return table
+
+
+def _skip_grid_columns(row, *, before: int = 0, after: int = 0) -> None:
+    """Drop cells from a row's ends and record them as gridBefore/gridAfter."""
+    tr = row._tr
+    for _ in range(before):
+        tr.remove(tr.tc_lst[0])
+    for _ in range(after):
+        tr.remove(tr.tc_lst[-1])
+    tr_pr = tr.get_or_add_trPr()
+    for tag, count in (("w:gridBefore", before), ("w:gridAfter", after)):
+        if count:
+            node = OxmlElement(tag)
+            node.set(qn("w:val"), str(count))
+            tr_pr.append(node)
+
+
+@pytest.mark.offline
+def test_extract_text_docx_grid_before_row_keeps_cells_in_their_columns():
+    document = Document()
+    table = _filled_table(document, 3, 3)
+    _skip_grid_columns(table.rows[1], before=1)
+
+    assert extract_text(_docx_bytes(document), "docx") == (
+        "r0c0\tr0c1\tr0c2\n\tr1c1\tr1c2\nr2c0\tr2c1\tr2c2"
+    )
+
+
+@pytest.mark.offline
+def test_extract_text_docx_grid_after_row_keeps_trailing_columns():
+    document = Document()
+    table = _filled_table(document, 2, 3)
+    _skip_grid_columns(table.rows[0], after=2)
+
+    assert extract_text(_docx_bytes(document), "docx") == "r0c0\t\t\nr1c0\tr1c1\tr1c2"
+
+
+@pytest.mark.offline
+def test_extract_text_docx_vertical_merge_below_grid_before_row():
+    document = Document()
+    table = _filled_table(document, 2, 3)
+    table.cell(0, 2).merge(table.cell(1, 2)).text = "Total"
+    _skip_grid_columns(table.rows[0], before=1)
+
+    # The continuation in row 2 sits under grid column 2, which row 1
+    # reaches only after its skipped first column.
+    assert extract_text(_docx_bytes(document), "docx") == (
+        "\tr0c1\tTotal\nr1c0\tr1c1\tTotal"
+    )
+
+
+@pytest.mark.offline
+def test_extract_text_docx_vertical_merge_continuation_without_cell_above():
+    document = Document()
+    table = _filled_table(document, 1, 2)
+    v_merge = OxmlElement("w:vMerge")
+    table.cell(0, 0)._tc.get_or_add_tcPr().append(v_merge)
+
+    # A malformed continuation in the first row has nothing to repeat.
+    assert extract_text(_docx_bytes(document), "docx") == "\tr0c1"
 
 
 def _make_encrypted_pdf_bytes(text: str, *, password: str, algorithm: str) -> bytes:
