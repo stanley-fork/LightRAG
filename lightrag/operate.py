@@ -59,6 +59,7 @@ from lightrag.utils import (
     make_relation_chunk_key,
     has_chunk_tracking_row,
     _cooperative_yield,
+    cancel_and_drain_tasks,
     wait_tasks_with_drain,
     performance_timing_log,
 )
@@ -743,7 +744,9 @@ def _handle_single_entity_extraction(
             return None
 
         # Process entity description with same cleaning pipeline
-        entity_description = sanitize_and_normalize_extracted_text(record_attributes[3])
+        entity_description = sanitize_and_normalize_extracted_text(
+            record_attributes[3], multiline=True
+        )
 
         if not entity_description.strip():
             logger.warning(
@@ -818,7 +821,9 @@ def _handle_single_relationship_extraction(
         edge_keywords = edge_keywords.replace("，", ",")
 
         # Process relationship description with same cleaning pipeline
-        edge_description = sanitize_and_normalize_extracted_text(record_attributes[4])
+        edge_description = sanitize_and_normalize_extracted_text(
+            record_attributes[4], multiline=True
+        )
         if not edge_description.strip():
             logger.warning(
                 f"Relationship extraction error: empty description for relation '{source}'~'{target}' in chunk '{chunk_key}'"
@@ -990,7 +995,7 @@ async def _process_json_extraction_result(
                 continue
 
             entity_description = sanitize_and_normalize_extracted_text(
-                str(entity_data.get("description", ""))
+                str(entity_data.get("description", "")), multiline=True
             )
             if not entity_description.strip():
                 logger.warning(
@@ -1057,7 +1062,7 @@ async def _process_json_extraction_result(
             edge_keywords = edge_keywords.replace("，", ",")
 
             edge_description = sanitize_and_normalize_extracted_text(
-                str(rel_data.get("description", ""))
+                str(rel_data.get("description", "")), multiline=True
             )
 
             if not edge_description.strip():
@@ -3720,6 +3725,8 @@ async def merge_nodes_and_edges(
         if on_anchors_durable is not None:
             await on_anchors_durable()
 
+    entity_tasks: list[asyncio.Task] = []
+    edge_tasks: list[asyncio.Task] = []
     try:
         # Get max async tasks limit from global_config for semaphore control
         graph_max_async = global_config.get("llm_model_max_async", 4) * 2
@@ -3791,7 +3798,6 @@ async def merge_nodes_and_edges(
                         raise prefixed_exception from e
 
         # Create entity processing tasks
-        entity_tasks = []
         for i, (entity_name, entities) in enumerate(all_nodes.items(), start=1):
             task = asyncio.create_task(
                 _locked_process_entity_name(entity_name, entities)
@@ -3888,7 +3894,6 @@ async def merge_nodes_and_edges(
                         raise prefixed_exception from e
 
         # Create relationship processing tasks
-        edge_tasks = []
         edge_task_labels: dict[asyncio.Task, str] = {}
         for i, (edge_key, edges) in enumerate(all_edges.items(), start=1):
             task = asyncio.create_task(_locked_process_edges(edge_key, edges))
@@ -3926,6 +3931,16 @@ async def merge_nodes_and_edges(
         # exceptions — is gone: a merge whose anchors cannot be persisted no
         # longer mutates the graph at all.
 
+    except (Exception, asyncio.CancelledError):
+        # wait_tasks_with_drain only covers cancellation while it is waiting.
+        # The creation loops yield (_cooperative_yield) before it starts, so a
+        # cancellation landing there would leave the writers created so far
+        # merging into the graph after this coroutine has exited and recovery
+        # has begun. Same exit rule as extract_entities: stop and collect
+        # every scheduled writer first. Tasks already drained by
+        # wait_tasks_with_drain are done, so this is then a no-op.
+        await cancel_and_drain_tasks(entity_tasks + edge_tasks)
+        raise
     finally:
         # On EVERY exit — the inter-phase await points (sleep(0) yields,
         # status-lock acquires) sit outside any narrower handler, and a
@@ -4634,6 +4649,18 @@ async def extract_entities(
                 first_exception, progress_prefix
             )
             raise prefixed_exception from first_exception
+    except (Exception, asyncio.CancelledError):
+        # asyncio.wait never cancels the tasks it waits on. Without this, an
+        # external cancellation of this coroutine (pipeline cancel, server
+        # shutdown) leaves the chunk tasks running: still calling the LLM for
+        # a document already abandoned, and failing later with nobody left to
+        # retrieve the exception ("Task exception was never retrieved").
+        # Same rule as wait_tasks_with_drain: cancel what still runs and
+        # collect every outcome before unwinding. On the failure path above
+        # the tasks are already done; this then only retrieves whatever the
+        # cancelled siblings raised.
+        await cancel_and_drain_tasks(tasks)
+        raise
     finally:
         # On EVERY exit — mirrors merge_nodes_and_edges. The success and
         # failure paths used to publish explicitly, but an external
