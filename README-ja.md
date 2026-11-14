@@ -102,7 +102,7 @@
 > **📦 オフラインデプロイ**: オフライン環境やエアギャップ環境については、すべての依存関係とキャッシュファイルを事前インストールする手順を記した[オフラインデプロイガイド](./docs/OfflineDeployment.md)を参照してください。
 
 > [!WARNING]
-> **共有ネットワーク上でサーバーを起動する前に、アクセス保護を設定してください。** `lightrag-server` はデフォルトですべてのインターフェース（`HOST=0.0.0.0`）で待ち受け、認証も無効です。クラウドホストでは全エンドポイントが公開され、誰でも LLM の利用枠を消費できてしまいます。初回起動の前に、`.env` でプライベートアドレス（`HOST=127.0.0.1`、または VPN / トンネルのアドレス）にバインドするか、認証を設定してください：`LIGHTRAG_API_KEY`、または `AUTH_ACCOUNTS` と `TOKEN_SECRET` の組み合わせ（`openssl rand -hex 32` で生成できます）。Ollama 互換の `/api/*` ルートはクライアント互換性のためデフォルトで認証不要です。これらにも認証を求めるには `WHITELIST_PATHS=/health` を設定してください。以下のすべてのインストール方法に当てはまります。
+> **共有ネットワーク上でサーバーを起動する前に、アクセス保護を設定してください。** `lightrag-server` はデフォルトですべてのインターフェース（`HOST=0.0.0.0`）で待ち受け、認証も無効です。クラウドホストでは全エンドポイントが公開され、誰でも LLM の利用枠を消費できてしまいます。初回起動の前に、`.env` でプライベートアドレス（`HOST=127.0.0.1`、または VPN / トンネルのアドレス）にバインドするか、認証を設定してください：`LIGHTRAG_API_KEY`、または `AUTH_ACCOUNTS` と `TOKEN_SECRET` の組み合わせ（`openssl rand -hex 32` で生成できます）。`LIGHTRAG_API_KEY` を設定すると、Ollama 互換の `/api/*` ルートにもそのキーが必要になります（Ollama クライアントは `Authorization: Bearer <key>` として送信します）。キーが未設定の場合、クライアント互換性のためこれらのルートは認証不要のままです。以下のすべてのインストール方法に当てはまります。
 
 ### PyPI からインストール
 
@@ -579,7 +579,7 @@ LightRAG は、農業、コンピュータサイエンス、法律、混合ド�
 
 **`migrate_llm_cache.py`** — `python -m lightrag.tools.migrate_llm_cache` — [README_MIGRATE_LLM_CACHE.md](./lightrag/tools/README_MIGRATE_LLM_CACHE.md)
 
-default モードのキャッシュ（抽出・要約・マルチモーダル解析）を KV ストレージバックエンド間で移行し、workspace の分離を保ちます。
+default モードのキャッシュ（抽出・要約・マルチモーダル解析・スマート見出し判定）を KV ストレージバックエンド間で移行し、workspace の分離を保ちます。
 
 **`kg_integrity_repair.py`** — `python -m lightrag.tools.kg_integrity_repair [--apply]` — [README_KG_INTEGRITY_REPAIR.md](./lightrag/tools/README_KG_INTEGRITY_REPAIR.md)
 

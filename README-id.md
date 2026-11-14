@@ -102,7 +102,7 @@
 > **📦 Deployment Offline**: Untuk environment offline atau air-gapped, lihat [Panduan Deployment Offline](./docs/OfflineDeployment.md) untuk petunjuk menginstal semua dependency dan file cache sebelumnya.
 
 > [!WARNING]
-> **Amankan server sebelum menjalankannya di jaringan bersama.** `lightrag-server` secara default mendengarkan di semua interface (`HOST=0.0.0.0`) dan autentikasinya nonaktif, sehingga di cloud host setiap endpoint terbuka untuk publik — dan siapa pun dapat menghabiskan kuota LLM Anda. Sebelum start pertama, pilih salah satu: bind ke alamat privat di `.env` (`HOST=127.0.0.1`, atau alamat VPN / tunnel), atau konfigurasikan autentikasi: `LIGHTRAG_API_KEY`, atau `AUTH_ACCOUNTS` bersama `TOKEN_SECRET` (buat dengan `openssl rand -hex 32`). Route `/api/*` yang kompatibel dengan Ollama tetap terbuka secara default demi kompatibilitas klien; set `WHITELIST_PATHS=/health` agar route tersebut juga memerlukan autentikasi. Ini berlaku untuk semua metode instalasi di bawah.
+> **Amankan server sebelum menjalankannya di jaringan bersama.** `lightrag-server` secara default mendengarkan di semua interface (`HOST=0.0.0.0`) dan autentikasinya nonaktif, sehingga di cloud host setiap endpoint terbuka untuk publik — dan siapa pun dapat menghabiskan kuota LLM Anda. Sebelum start pertama, pilih salah satu: bind ke alamat privat di `.env` (`HOST=127.0.0.1`, atau alamat VPN / tunnel), atau konfigurasikan autentikasi: `LIGHTRAG_API_KEY`, atau `AUTH_ACCOUNTS` bersama `TOKEN_SECRET` (buat dengan `openssl rand -hex 32`). Setelah `LIGHTRAG_API_KEY` di-set, route `/api/*` yang kompatibel dengan Ollama juga memerlukan key tersebut (klien Ollama mengirimnya sebagai `Authorization: Bearer <key>`); tanpa key, route tersebut tetap terbuka demi kompatibilitas klien. Ini berlaku untuk semua metode instalasi di bawah.
 
 ### Instal dari PyPI
 
@@ -579,7 +579,7 @@ Menghapus entri LLM cache mode query (`mix:*`, `hybrid:*`, `local:*`, `global:*`
 
 **`migrate_llm_cache.py`** — `python -m lightrag.tools.migrate_llm_cache` — [README_MIGRATE_LLM_CACHE.md](./lightrag/tools/README_MIGRATE_LLM_CACHE.md)
 
-Memigrasikan cache mode default (extraction, summary, analisis multimodal) antar-KV storage backend dengan tetap mempertahankan isolasi workspace.
+Memigrasikan cache mode default (extraction, summary, analisis multimodal, smart-heading) antar-KV storage backend dengan tetap mempertahankan isolasi workspace.
 
 **`kg_integrity_repair.py`** — `python -m lightrag.tools.kg_integrity_repair [--apply]` — [README_KG_INTEGRITY_REPAIR.md](./lightrag/tools/README_KG_INTEGRITY_REPAIR.md)
 

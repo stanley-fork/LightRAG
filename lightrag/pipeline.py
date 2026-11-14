@@ -1462,6 +1462,11 @@ class _PipelineMixin:
                             f"Original doc_id: {attempt.get('original_doc_id', doc_id)}, "
                             f"Status: {attempt.get('existing_status', 'unknown')}"
                         )
+                        if attempt.get("existing_status") == DocStatus.DELETING:
+                            error_msg = (
+                                "Document is partially deleted; re-run deletion first. "
+                                + error_msg
+                            )
                         summary = (
                             f"[DUPLICATE:{duplicate_kind}] Original document: "
                             f"{attempt.get('original_doc_id', doc_id)}"
@@ -7945,6 +7950,10 @@ class _PipelineMixin:
                     sidecar_path.write_text(
                         json.dumps(payload, ensure_ascii=False, indent=2),
                         encoding="utf-8",
+                        # LF on every platform: the sidecar is a byte-level
+                        # interchange format, so the rewrite must not introduce
+                        # the host's line ending into an indented payload.
+                        newline="\n",
                     )
                 except OSError as exc:
                     logger.warning(
