@@ -302,6 +302,17 @@ class QueryParam:
 
 > The default value of `top_k` can be changed by the environment variable `TOP_K`.
 
+For graph query modes (`local`, `global`, `hybrid`, `mix`), `max_total_tokens`
+also caps the graph context when the entity and relationship limits are larger.
+Whole records are retained in ranking order before selecting their source chunks;
+the final check includes the rendered system prompt, user query, chunk references,
+and configured user instructions. If the required prompt and query alone cannot
+fit, the query returns no result without calling the answer model. Graph records
+are filled before chunks: when they use up the budget, no chunk is sent, the answer
+relies on the graph context alone, and a "Token budget left no room" warning is
+logged. Conversation history and provider-specific message framing are outside
+this context budget.
+
 
 ## LLM and Embedding Injection
 
@@ -474,6 +485,23 @@ async def initialize_rag():
     await rag.initialize_storages()
     return rag
 ```
+
+**Embedding batch sizes:** `llama_index_embed` calls the model's public
+`aget_text_embedding_batch`, so the model's `embed_batch_size` and
+`embeddings_cache` apply. The two batch sizes stack:
+
+- LightRAG's `embedding_batch_num` (`EMBEDDING_BATCH_NUM`) sets how many texts
+  one `embedding_func` call hands to the adapter, and `embedding_func_max_async`
+  (`EMBEDDING_FUNC_MAX_ASYNC`) caps how many of those calls run at once.
+- The model's `embed_batch_size` (LlamaIndex default: 10) splits each call into
+  sub-batches of at most that many texts, one embedding request each, and
+  LlamaIndex sends a call's sub-batches concurrently. Up to
+  `embedding_func_max_async × ceil(embedding_batch_num / embed_batch_size)`
+  requests can therefore be in flight; with `EMBEDDING_BATCH_NUM=32` and the
+  default `embed_batch_size`, each call becomes four concurrent requests.
+- Set `embed_batch_size` to the provider's per-request input limit. To keep one
+  request per call, set `embed_batch_size >= embedding_batch_num`; to lower the
+  overall request concurrency, lower `embedding_func_max_async`.
 
 **Further reading:**
 - [LlamaIndex Documentation](https://developers.llamaindex.ai/python/framework/)

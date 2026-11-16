@@ -4,6 +4,7 @@ import os
 import logging
 import warnings
 
+import inspect
 from collections.abc import AsyncIterator
 
 import pipmaster as pm
@@ -223,7 +224,9 @@ def create_openai_async_client(
         client_configs: Additional configuration options for the AsyncOpenAI client.
             These will override any default configurations but will be overridden by
             explicit parameters (api_key, base_url). Pass ``max_retries`` here to
-            re-enable the SDK's own retry loop (see below).
+            re-enable the SDK's own retry loop (see below). For non-Azure clients,
+            ``default_headers`` are merged with LightRAG's defaults, with caller
+            values taking precedence; names are matched case-insensitively.
 
     Returns:
         An AsyncOpenAI or AsyncAzureOpenAI client instance.
@@ -288,6 +291,12 @@ def create_openai_async_client(
         if client_configs is None:
             client_configs = {}
 
+        # Header names are case-insensitive: a caller key that differs from a
+        # default only in case must replace it, not be sent alongside it.
+        canonical_names = {name.lower(): name for name in default_headers}
+        for name, value in (client_configs.get("default_headers") or {}).items():
+            default_headers[canonical_names.get(name.lower(), name)] = value
+
         # Create a merged config dict with precedence: explicit params > client_configs > defaults
         merged_configs = {
             # Retry ownership belongs to the tenacity decorators; see docstring.
@@ -308,6 +317,61 @@ def create_openai_async_client(
             merged_configs["timeout"] = timeout
 
         return AsyncOpenAI(**merged_configs)
+
+
+def _caller_supplied_http_client(client_configs: dict[str, Any] | None) -> bool:
+    """True when the caller injected a live ``http_client`` into AsyncOpenAI.
+
+    ``http_client=None`` is not ownership: the OpenAI SDK still builds its own
+    client in that case. ``http_async_client`` is not an AsyncOpenAI
+    constructor argument and is ignored.
+    """
+    if not client_configs:
+        return False
+    return client_configs.get("http_client") is not None
+
+
+async def _close_openai_client_if_unowned(
+    client: Any, caller_supplied_http_client: bool
+) -> None:
+    """Close an SDK-owned client; leave a caller-supplied httpx client open.
+
+    ``AsyncOpenAI.close()`` is ``await self._client.aclose()``. Closing a
+    client LightRAG did not create poisons tenacity retries and later calls
+    that reuse the same ``openai_client_configs["http_client"]``.
+    """
+    if caller_supplied_http_client:
+        return
+    try:
+        await client.close()
+    except Exception as close_error:
+        logger.warning(f"Failed to close OpenAI client: {close_error}")
+
+
+async def _close_openai_stream_response(response: Any) -> None:
+    """Release a streaming completion without assuming ``aclose``.
+
+    openai 2.x ``AsyncStream`` exposes async ``close()`` only. Stream cleanup
+    is independent of whether LightRAG owns the HTTP client.
+    """
+    closer = getattr(response, "aclose", None)
+    if not callable(closer):
+        closer = getattr(response, "close", None)
+    if not callable(closer):
+        return
+    try:
+        result = closer()
+        if inspect.isawaitable(result):
+            await result
+        logger.debug("Successfully closed stream response")
+    except (AttributeError, TypeError) as close_error:
+        logger.debug(
+            f"Stream response cleanup not supported by client wrapper: {close_error}"
+        )
+    except Exception as close_error:
+        logger.warning(
+            f"Unexpected error during stream response cleanup: {close_error}"
+        )
 
 
 # Token-limit-truncated completions (finish_reason == "length") are returned
@@ -421,7 +485,10 @@ async def openai_complete_if_cache(
             - openai_client_configs: Dict of configuration options for the AsyncOpenAI client.
                 These will be passed to the client constructor but will be overridden by
                 explicit parameters (api_key, base_url). Supports proxy configuration,
-                custom headers, retry policies, etc.
+                custom headers, retry policies, etc. A non-None ``http_client`` here
+                stays owned by the caller: LightRAG never closes it (not on retries,
+                errors, cancellation or success), so it can be shared across calls,
+                and the caller must close it when done.
 
     Returns:
         The completed text (with integrated COT content if available) or an async iterator
@@ -448,6 +515,7 @@ async def openai_complete_if_cache(
 
     # Extract client configuration options
     client_configs = kwargs.pop("openai_client_configs", {})
+    caller_supplied_http_client = _caller_supplied_http_client(client_configs)
 
     # Deprecation shims: map legacy boolean flags to response_format only when
     # an explicit response_format was not supplied by the caller. Prefer passing
@@ -539,46 +607,44 @@ async def openai_complete_if_cache(
             model=api_model, messages=messages, **kwargs
         )
     except asyncio.CancelledError:
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        # A cancelled request (query timeout, client gone) must not close a
+        # caller-supplied http_client: other concurrent calls may share it.
+        await _close_openai_client_if_unowned(
+            openai_async_client, caller_supplied_http_client
+        )
         raise
     except APITimeoutError as e:
         logger.error(f"OpenAI API Timeout Error: {e}")
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        await _close_openai_client_if_unowned(
+            openai_async_client, caller_supplied_http_client
+        )
         raise
     except APIConnectionError as e:
         logger.error(f"OpenAI API Connection Error: {e}")
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        await _close_openai_client_if_unowned(
+            openai_async_client, caller_supplied_http_client
+        )
         raise
     except RateLimitError as e:
         if is_permanent_rate_limit_error(e):
             logger.error(f"OpenAI API Spend Limit Reached (not retrying): {e}")
         else:
             logger.error(f"OpenAI API Rate Limit Error: {e}")
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        await _close_openai_client_if_unowned(
+            openai_async_client, caller_supplied_http_client
+        )
         raise
     except BadRequestError as e:
         # A "could not parse JSON body" 400 is transient (corrupted/truncated
         # request body in transit) and succeeds on retry; re-raise it as a
         # retryable type. Genuine 400s (bad params, content policy) fail fast.
-        # Either way we must close the client before re-raising, matching the
-        # other except branches above — otherwise non-transient 400s would
-        # leak httpx connections in validation-heavy/misconfigured runs.
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        # Either way we must close an SDK-owned client before re-raising,
+        # matching the other except branches above. Otherwise non-transient
+        # 400s would leak httpx connections in validation-heavy/misconfigured
+        # runs. A caller-supplied http_client is left open for the retry.
+        await _close_openai_client_if_unowned(
+            openai_async_client, caller_supplied_http_client
+        )
         # Heuristic: match on the provider's error wording. It can drift across
         # providers/proxies or localization, and a genuinely malformed request
         # body (e.g. invalid user-supplied JSON) could also surface this text —
@@ -603,10 +669,9 @@ async def openai_complete_if_cache(
         logger.error(
             f"OpenAI API Call Failed,\nModel: {model},\nParams: {kwargs}, Got: {e}{extra}"
         )
-        try:
-            await openai_async_client.close()
-        except Exception as close_error:
-            logger.warning(f"Failed to close OpenAI client: {close_error}")
+        await _close_openai_client_if_unowned(
+            openai_async_client, caller_supplied_http_client
+        )
         raise
 
     if hasattr(response, "__aiter__"):
@@ -757,26 +822,11 @@ async def openai_complete_if_cache(
                         )
 
                 logger.error(f"Error in stream response: {str(e)}")
-                # Try to clean up resources if possible
-                if (
-                    iteration_started
-                    and hasattr(response, "aclose")
-                    and callable(getattr(response, "aclose", None))
-                ):
-                    try:
-                        await response.aclose()
-                        logger.debug("Successfully closed stream response after error")
-                    except Exception as close_error:
-                        logger.warning(
-                            f"Failed to close stream response: {close_error}"
-                        )
-                # Ensure client is closed in case of exception
-                try:
-                    await openai_async_client.close()
-                except Exception as client_close_error:
-                    logger.warning(
-                        f"Failed to close OpenAI client after stream error: {client_close_error}"
-                    )
+                if iteration_started:
+                    await _close_openai_stream_response(response)
+                await _close_openai_client_if_unowned(
+                    openai_async_client, caller_supplied_http_client
+                )
                 raise
             finally:
                 # Final safety check for unclosed COT tags, skipped while
@@ -790,35 +840,15 @@ async def openai_complete_if_cache(
                             f"Failed to close COT tag in finally block: {final_close_error}"
                         )
 
-                # Ensure resources are released even if no exception occurs
-                # Note: Some wrapped clients (e.g., Langfuse) may not implement aclose() properly
-                if iteration_started and hasattr(response, "aclose"):
-                    aclose_method = getattr(response, "aclose", None)
-                    if callable(aclose_method):
-                        try:
-                            await response.aclose()
-                            logger.debug("Successfully closed stream response")
-                        except (AttributeError, TypeError) as close_error:
-                            # Some wrapper objects may report hasattr(aclose) but fail when called
-                            # This is expected behavior for certain client wrappers
-                            logger.debug(
-                                f"Stream response cleanup not supported by client wrapper: {close_error}"
-                            )
-                        except Exception as close_error:
-                            logger.warning(
-                                f"Unexpected error during stream response cleanup: {close_error}"
-                            )
+                # Stream cleanup is independent of HTTP-client ownership:
+                # openai 2.x AsyncStream.close() must still run so an
+                # early-stopped response does not pin the connection.
+                if iteration_started:
+                    await _close_openai_stream_response(response)
 
-                # This prevents resource leaks since the caller doesn't handle closing
-                try:
-                    await openai_async_client.close()
-                    logger.debug(
-                        "Successfully closed OpenAI client for streaming response"
-                    )
-                except Exception as client_close_error:
-                    logger.warning(
-                        f"Failed to close OpenAI client in streaming finally block: {client_close_error}"
-                    )
+                await _close_openai_client_if_unowned(
+                    openai_async_client, caller_supplied_http_client
+                )
 
         return inner()
 
@@ -852,10 +882,9 @@ async def openai_complete_if_cache(
                     + _describe_invalid_response(response)
                 )
                 logger.error(error_message)
-                try:
-                    await openai_async_client.close()
-                except Exception as close_error:
-                    logger.warning(f"Failed to close OpenAI client: {close_error}")
+                await _close_openai_client_if_unowned(
+                    openai_async_client, caller_supplied_http_client
+                )
                 raise InvalidResponseError(error_message)
 
             message = response.choices[0].message
@@ -943,10 +972,9 @@ async def openai_complete_if_cache(
                         f"({diagnostics}): {hint}"
                     )
                     logger.error(error_message)
-                    try:
-                        await openai_async_client.close()
-                    except Exception as close_error:
-                        logger.warning(f"Failed to close OpenAI client: {close_error}")
+                    await _close_openai_client_if_unowned(
+                        openai_async_client, caller_supplied_http_client
+                    )
                     # The hint rides along into the exception (and therefore
                     # into doc_status.error_msg) rather than living only in the
                     # server log: the operator reading the failed document is
@@ -983,13 +1011,9 @@ async def openai_complete_if_cache(
 
             return final_content
         finally:
-            # Ensure client is closed in all cases for non-streaming responses
-            try:
-                await openai_async_client.close()
-            except Exception as close_error:
-                logger.warning(
-                    f"Failed to close OpenAI client in non-streaming finally block: {close_error}"
-                )
+            await _close_openai_client_if_unowned(
+                openai_async_client, caller_supplied_http_client
+            )
 
 
 async def openai_complete(
@@ -1155,7 +1179,9 @@ async def openai_embed(
         client_configs: Additional configuration options for the AsyncOpenAI/AsyncAzureOpenAI client.
             These will override any default configurations but will be overridden by
             explicit parameters (api_key, base_url). Supports proxy configuration,
-            custom headers, retry policies, etc.
+            custom headers, retry policies, etc. A non-None ``http_client`` here
+            stays owned by the caller: LightRAG never closes it, so it can be
+            shared across calls, and the caller must close it when done.
         token_tracker: Optional token usage tracker for monitoring API usage.
         use_azure: Whether to use Azure OpenAI service instead of standard OpenAI.
             When True, creates an AsyncAzureOpenAI client. Default is False.
@@ -1233,8 +1259,9 @@ async def openai_embed(
         api_version=api_version,
         client_configs=client_configs,
     )
+    caller_supplied_http_client = _caller_supplied_http_client(client_configs)
 
-    async with openai_async_client:
+    try:
         # Determine the correct model identifier to use
         # For Azure OpenAI, we must use the deployment name instead of the model name
         api_model = azure_deployment if use_azure and azure_deployment else model
@@ -1270,6 +1297,10 @@ async def openai_embed(
                 else np.frombuffer(base64.b64decode(dp.embedding), dtype=np.float32)
                 for dp in response.data
             ]
+        )
+    finally:
+        await _close_openai_client_if_unowned(
+            openai_async_client, caller_supplied_http_client
         )
 
 
