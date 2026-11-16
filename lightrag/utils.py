@@ -494,9 +494,11 @@ def safe_log_value(value: str, max_length: int = 200) -> str:
     submitted username, and operator-supplied identifiers in audited admin
     actions (source-conflict repair).
     """
-    sanitized = "".join(ch if ch.isprintable() else "?" for ch in value)
-    if len(sanitized) > max_length:
-        sanitized = sanitized[:max_length] + "…(truncated)"
+    # Truncate BEFORE the per-character pass: the value can be as large as a
+    # request body, and the replacement is one-for-one, so the result is the same.
+    sanitized = "".join(ch if ch.isprintable() else "?" for ch in value[:max_length])
+    if len(value) > max_length:
+        sanitized += "…(truncated)"
     return sanitized
 
 
@@ -4388,6 +4390,14 @@ def _map_child_span(
     return {"start": abs_start, "end": abs_end}
 
 
+# U+FFFD. A token window whose boundary splits a multi-byte UTF-8 character
+# (any non-ASCII char: 2-byte Latin/Greek, 3-byte CJK and symbols, 4-byte emoji)
+# decodes the partial bytes to this character. Shared by the fixed-token chunker,
+# this function and sidecar backfill so the three agree on what a boundary
+# artifact is.
+_REPLACEMENT_CHAR = "\ufffd"
+
+
 def enforce_chunk_token_limit_before_embedding(
     chunking_result: list[dict[str, Any]] | tuple[dict[str, Any], ...],
     tokenizer: Tokenizer,
@@ -4418,6 +4428,14 @@ def enforce_chunk_token_limit_before_embedding(
     cannot be trusted at all, and this raises ``ChunkBlockMatchError`` rather
     than silently emitting a wrong span — the same failure sidecar backfill
     itself would eventually surface, just earlier and with better context.
+    A span recovered by stripping boundary U+FFFD, or a parent with no span
+    whose content still contains U+FFFD, is not that divergence: the children
+    are marked ``_source_span_unavailable`` (popped before the chunk dict is
+    stored) so backfill degrades them instead of failing the document. The
+    recovered case is recognized by the content minus its leading/trailing
+    U+FFFD matching the source slice; interior U+FFFD that the source itself
+    contains does not disqualify it. Content that does not reconcile with the
+    source slice still raises.
 
     Known limitation -- ``sidecar`` is not re-scoped for pre-sidecar chunks:
     this function runs BEFORE :func:`lightrag.sidecar.backfill.backfill_chunk_sidecars`
@@ -4491,6 +4509,7 @@ def enforce_chunk_token_limit_before_embedding(
         # O(parent length)).
         projection: list[int] | None = None
         parent_start = parent_end = None
+        span_unavailable = False
         if isinstance(parent_span, dict):
             try:
                 parent_start = int(parent_span["start"])
@@ -4503,7 +4522,32 @@ def enforce_chunk_token_limit_before_embedding(
                 parent_start = parent_end = None
 
             if parent_start is not None and parent_end - parent_start != len(content):
-                if source_content:
+                # A span recovered by stripping boundary U+FFFD is not a
+                # verbatim slice of the chunk beside it. Child offsets cannot
+                # be projected (a ZWJ sequence makes the width gap unequal to
+                # the replacement count). Mark the children unavailable
+                # instead of raising. Interior U+FFFD is allowed: the source
+                # comparison below proves it is the source's own character.
+                # Content that does not reconcile with the source slice is
+                # still a real divergence.
+                boundary_artifact = False
+                if source_content and (
+                    content.startswith(_REPLACEMENT_CHAR)
+                    or content.endswith(_REPLACEMENT_CHAR)
+                ):
+                    stripped = content.strip(_REPLACEMENT_CHAR)
+                    if stripped:
+                        source_slice = source_content[parent_start:parent_end]
+                        stripped_compact = "".join(stripped.split())
+                        if source_slice == stripped or (
+                            stripped_compact
+                            and stripped_compact == "".join(source_slice.split())
+                        ):
+                            boundary_artifact = True
+                if boundary_artifact:
+                    span_unavailable = True
+                    parent_start = parent_end = None
+                elif source_content:
                     projection = _parent_to_source_projection(
                         source_content, parent_start, parent_end, content
                     )
@@ -4520,6 +4564,12 @@ def enforce_chunk_token_limit_before_embedding(
                     # _map_child_span is never reached with an untrustworthy
                     # direct-arithmetic assumption).
                     parent_start = parent_end = None
+        if parent_start is None and _REPLACEMENT_CHAR in content:
+            # No usable parent span (probe failed, or a boundary-recovered
+            # span we refused to project). Children that no longer contain
+            # U+FFFD must degrade instead of failing backfill. A literal
+            # U+FFFD is not itself the marker.
+            span_unavailable = True
 
         total_parts = len(spans)
         for i, span in enumerate(spans, 1):
@@ -4538,15 +4588,19 @@ def enforce_chunk_token_limit_before_embedding(
             if isinstance(base_chunk_id, str) and base_chunk_id.strip():
                 new_dp["chunk_id"] = f"{base_chunk_id}-s{i:02d}"
 
-            child_span = None
-            if parent_start is not None:
-                child_span = _map_child_span(
-                    span.start, span.end, parent_start, parent_end, projection
-                )
-            if child_span is not None:
-                new_dp["_source_span"] = child_span
-            elif "_source_span" in new_dp:
+            if span_unavailable:
                 new_dp.pop("_source_span", None)
+                new_dp["_source_span_unavailable"] = True
+            else:
+                child_span = None
+                if parent_start is not None:
+                    child_span = _map_child_span(
+                        span.start, span.end, parent_start, parent_end, projection
+                    )
+                if child_span is not None:
+                    new_dp["_source_span"] = child_span
+                elif "_source_span" in new_dp:
+                    new_dp.pop("_source_span", None)
 
             new_dp["split_type"] = "hard_fallback"
             new_dp["split_part"] = i
