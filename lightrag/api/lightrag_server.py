@@ -932,6 +932,7 @@ def create_optimized_embedding_function(
                 # Pass model only if provided, let function use its default otherwise
                 kwargs = {
                     "texts": texts,
+                    "embedding_dim": embedding_dim,
                     "aws_region": getattr(args, "aws_region", None),
                     "aws_access_key_id": getattr(args, "aws_access_key_id", None),
                     "aws_secret_access_key": getattr(
@@ -3455,7 +3456,7 @@ def configure_logging():
     log_file_path = os.path.abspath(os.path.join(log_dir, DEFAULT_LOG_FILENAME))
 
     print(f"\nLightRAG log file: {log_file_path}\n")
-    os.makedirs(os.path.dirname(log_dir), exist_ok=True)
+    os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
 
     # Get log file max size and backup count from environment variables
     log_max_bytes = get_env_value("LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES, int)
