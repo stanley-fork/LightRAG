@@ -3868,38 +3868,46 @@ def test_sanitize_filename_rejects_traversal_instead_of_rewriting(tmp_path):
     assert exc.value.status_code == 400
 
 
-def test_sanitize_filename_rejects_separator_and_control_characters(tmp_path):
-    for filename in ("nested/report.pdf", "nested\\report.pdf", "report.pdf\x00"):
-        with pytest.raises(_document_routes.HTTPException) as exc:
-            _document_routes.sanitize_filename(filename, tmp_path)
+@pytest.mark.parametrize(
+    "filename", ["nested/report.pdf", "nested\\report.pdf", "report.pdf\x00"]
+)
+def test_sanitize_filename_rejects_separator_and_control_characters(tmp_path, filename):
+    with pytest.raises(_document_routes.HTTPException) as exc:
+        _document_routes.sanitize_filename(filename, tmp_path)
 
-        assert exc.value.status_code == 400
+    assert exc.value.status_code == 400
 
 
-def test_sanitize_filename_rejects_colon(tmp_path):
-    for filename in (
+@pytest.mark.parametrize(
+    "filename",
+    [
         "safe.pdf:payload.pdf",  # NTFS alternate-data-stream reference
         "C:report.pdf",  # drive-relative, not a literal basename
-    ):
-        with pytest.raises(_document_routes.HTTPException) as exc:
-            _document_routes.sanitize_filename(filename, tmp_path)
+    ],
+)
+def test_sanitize_filename_rejects_colon(tmp_path, filename):
+    with pytest.raises(_document_routes.HTTPException) as exc:
+        _document_routes.sanitize_filename(filename, tmp_path)
 
-        assert exc.value.status_code == 400
+    assert exc.value.status_code == 400
 
 
-def test_sanitize_filename_allows_other_windows_reserved_characters(tmp_path):
-    """Unlike ':', these don't let the name be reinterpreted as a different
-    path (no shell-out or unescaped glob() call site uses upload filenames in
-    this codebase), so they're accepted rather than pre-emptively rejected."""
-    for filename in (
+@pytest.mark.parametrize(
+    "filename",
+    [
         'quoted"name.pdf',
         "piped|name.pdf",
         "glob?name.pdf",
         "glob*name.pdf",
         "less<than.pdf",
         "greater>than.pdf",
-    ):
-        assert _document_routes.sanitize_filename(filename, tmp_path) == filename
+    ],
+)
+def test_sanitize_filename_allows_other_windows_reserved_characters(tmp_path, filename):
+    """Unlike ':', these don't let the name be reinterpreted as a different
+    path (no shell-out or unescaped glob() call site uses upload filenames in
+    this codebase), so they're accepted rather than pre-emptively rejected."""
+    assert _document_routes.sanitize_filename(filename, tmp_path) == filename
 
 
 def test_sanitize_filename_allows_non_traversal_dot_sequences(tmp_path):
@@ -3930,7 +3938,8 @@ def test_upload_file_opener_creates_new_file_with_private_permissions(tmp_path):
         fh.write(b"content")
 
     assert path.read_bytes() == b"content"
-    assert (path.stat().st_mode & 0o777) == 0o600
+    if sys.platform != "win32":  # POSIX chmod semantics; NTFS reports 0o666
+        assert (path.stat().st_mode & 0o777) == 0o600
 
 
 def test_upload_file_opener_falls_back_when_dir_fd_unsupported(tmp_path, monkeypatch):
@@ -3956,7 +3965,8 @@ def test_upload_file_opener_falls_back_when_dir_fd_unsupported(tmp_path, monkeyp
         fh.write(b"content")
 
     assert path.read_bytes() == b"content"
-    assert (path.stat().st_mode & 0o777) == 0o600
+    if sys.platform != "win32":  # POSIX chmod semantics; NTFS reports 0o666
+        assert (path.stat().st_mode & 0o777) == 0o600
     assert directory_open_attempts == []
 
     with pytest.raises(FileExistsError):
