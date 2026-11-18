@@ -13,6 +13,7 @@ from typing import (
     Awaitable,
     Callable,
     ClassVar,
+    Collection,
     Sequence,
     TypeVar,
     Union,
@@ -97,6 +98,8 @@ T = TypeVar("T")
 
 # PostgreSQL identifier length limit (in bytes)
 PG_MAX_IDENTIFIER_LENGTH = 63
+# A model-suffixed vector table as the catalog reports it: ``..._{model}_{dim}d``.
+_MODEL_TABLE_RE = re.compile(r"[a-z0-9_]+_\d+d")
 
 # Flush-time batching limits shared by the PostgreSQL non-graph write paths
 # (PGKVStorage, PGVectorStorage, PGDocStatusStorage). Mirrors the MONGO_* /
@@ -5998,6 +6001,87 @@ class PGVectorStorage(BaseVectorStorage):
             )
             return {"status": "error", "message": str(e)}
 
+    def model_container_name(self, model_name: str, embedding_dim: int) -> str | None:
+        suffix = self._collection_suffix_for(model_name, embedding_dim)
+        return f"{self.legacy_table_name}_{suffix}".lower() if suffix else None
+
+    async def drop_sibling_models(
+        self, vouched: Collection[str] = ()
+    ) -> dict[str, str]:
+        """Delete this workspace's rows from every other model's table.
+
+        A sibling is a table named ``{base}_{model}_{dim}d`` visible on the
+        search path, other than ``table_name``, that has both a ``workspace`` and a
+        ``content_vector`` column -- the shape ``_pg_create_table`` gives it --
+        so an unrelated table that happens to share the prefix is left alone.
+        Rows are removed with the same workspace-scoped DELETE as ``drop()``;
+        the tables stay, because they are shared with other workspaces. That
+        evidence is always present, so ``vouched`` is unused. Same
+        preconditions as ``drop()``.
+
+        ``_flush_lock`` is not taken: no instance buffers writes for a
+        sibling. The legacy table needs nothing here: ``drop()`` already
+        cleared this workspace out of it, so an emptied sibling has nothing to
+        migrate back on the next start.
+        """
+        try:
+            # Visibility, not a schema name: ``pg_table_is_visible`` resolves
+            # exactly as the unqualified names in every other statement here
+            # do (and as ``check_table_exists``'s ``to_regclass``).
+            # ``current_schema()`` is only the FIRST schema on the search
+            # path, which is not where the tables are once another schema
+            # precedes ``public`` -- a ``"$user"`` schema, or ``ag_catalog``
+            # on a connection AGE configured -- and a sibling this query
+            # misses is reported as a clean sweep.
+            rows = await self.db.query(
+                """
+                SELECT c.relname AS table_name
+                FROM pg_catalog.pg_class c
+                WHERE c.relkind IN ('r', 'p')
+                  AND pg_catalog.pg_table_is_visible(c.oid)
+                  AND c.relname LIKE $1
+                  AND c.relname <> $2
+                  AND EXISTS (
+                      SELECT 1 FROM pg_catalog.pg_attribute a
+                      WHERE a.attrelid = c.oid
+                        AND a.attname = 'workspace'
+                        AND NOT a.attisdropped)
+                  AND EXISTS (
+                      SELECT 1 FROM pg_catalog.pg_attribute a
+                      WHERE a.attrelid = c.oid
+                        AND a.attname = 'content_vector'
+                        AND NOT a.attisdropped)
+                """,
+                [self.legacy_table_name.lower() + "\\_%", self.table_name.lower()],
+                multirows=True,
+            )
+            cleared = []
+            prefix = self.legacy_table_name.lower() + "_"
+            for row in rows or []:
+                name = row["table_name"]
+                # LIKE treats the base name's own underscores as wildcards, and
+                # the name is formatted into SQL below: accept only the exact
+                # prefix and the identifier shape the suffix fold produces.
+                if not name.startswith(prefix) or not _MODEL_TABLE_RE.fullmatch(name):
+                    continue
+                sql = SQL_TEMPLATES["drop_specifiy_table_workspace"].format(
+                    table_name=name
+                )
+                await self.db.execute(sql, {"workspace": self.workspace})
+                cleared.append(name)
+            if cleared:
+                logger.info(
+                    f"[{self.workspace}] Cleared workspace rows from sibling "
+                    f"model tables: {cleared}"
+                )
+            return {"status": "success", "message": "sibling models dropped"}
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Error clearing sibling model tables "
+                f"for {self.namespace}: {e}"
+            )
+            return {"status": "error", "message": str(e)}
+
 
 def _parse_doc_status_datetime(
     dt_str: Any,
@@ -6516,11 +6600,13 @@ class PGDocStatusStorage(DocStatusStorage):
         ``datetime.fromisoformat`` (microseconds preserved) and is normalized
         back to the naive-UTC form the TIMESTAMP column stores, so the
         parameterized row-value comparison resumes at exactly the last
-        consumed key. A malformed cursor raises
+        consumed key. Any payload other than that two-element list raises
         :class:`~lightrag.exceptions.StorageControlPlaneError`.
         """
         try:
             decoded = json.loads(opaque)
+            if not isinstance(decoded, list) or len(decoded) != 2:
+                raise ValueError("cursor must be a two-element list")
             created_iso, doc_id = decoded
             if not isinstance(doc_id, str):
                 raise ValueError("cursor id must be a string")
@@ -7695,9 +7781,11 @@ class PGGraphQueryException(Exception):
         if isinstance(exception, dict):
             self.message = exception["message"] if "message" in exception else "unknown"
             self.details = exception["details"] if "details" in exception else "unknown"
+            self.graph_name = exception.get("graph_name")
         else:
             self.message = exception
             self.details = "unknown"
+            self.graph_name = None
 
     def get_message(self) -> str:
         return self.message
@@ -7729,7 +7817,6 @@ class PGGraphEdgeWriteLostError(PGGraphQueryException):
         target_node_id: str,
         missing_endpoints: Sequence[str] = (),
     ) -> None:
-        self.graph_name = graph_name
         self.source_node_id = source_node_id
         self.target_node_id = target_node_id
         self.missing_endpoints = tuple(missing_endpoints)
@@ -7746,10 +7833,58 @@ class PGGraphEdgeWriteLostError(PGGraphQueryException):
             f"PostgreSQL AGE: edge `{source_node_id}`-`{target_node_id}` was not "
             f"written to graph {graph_name} ({details})"
         )
-        super().__init__({"message": message, "details": details})
+        super().__init__(
+            {"message": message, "details": details, "graph_name": graph_name}
+        )
         # PGGraphQueryException does not populate Exception.args, which would
         # make str(exc) empty in logs and test output.
         self.args = (message,)
+
+
+# The labels PGGraphStorage creates plus AGE's default parents. A missing table
+# under one of these names is a real error, never the dangling-label defect.
+_AGE_REAL_LABEL_TABLES: frozenset[str] = frozenset(
+    {"base", "DIRECTED", "_ag_label_vertex", "_ag_label_edge"}
+)
+
+
+def _is_age_dangling_label_error(cause: BaseException, graph_name: str | None) -> bool:
+    """Return True when ``cause`` is the Apache AGE label-cache dangling pointer error.
+
+    Rules:
+    - Known Apache AGE 1.7.x defect: ``_label_name`` returns a pointer into the
+      backend-local label cache, which a cache invalidation can free while the
+      vertex properties are detoasted. ``SET`` then opens ``<graph>.<garbage>``.
+    - Retried as a mitigation only; the real fix belongs upstream in AGE. It does
+      not mean LightRAG's graph or data is corrupted.
+    - Matches only a missing relation inside ``graph_name``'s schema that is not
+      one of ``_AGE_REAL_LABEL_TABLES``: as ``UndefinedTableError`` (SQLSTATE
+      42P01), or as the ``UnicodeDecodeError`` asyncpg raises when the garbage is
+      not valid UTF-8. Anything else, or no ``graph_name``, returns False.
+    """
+    if not graph_name:
+        return False
+    prefix = f'relation "{graph_name}.'
+    suffix = '" does not exist'
+
+    if isinstance(cause, UnicodeDecodeError):
+        blob = cause.object
+        if not isinstance(blob, bytes):
+            return False
+        return prefix.encode("utf-8") in blob and suffix.encode("utf-8") in blob
+
+    if isinstance(cause, asyncpg.exceptions.UndefinedTableError):
+        msg = str(cause)
+        label_start = msg.find(prefix)
+        if label_start == -1:
+            return False
+        label_start += len(prefix)
+        label_end = msg.find(suffix, label_start)
+        if label_end == -1:
+            return False
+        return msg[label_start:label_end] not in _AGE_REAL_LABEL_TABLES
+
+    return False
 
 
 def _is_transient_graph_write_error(exc: BaseException) -> bool:
@@ -7758,15 +7893,19 @@ def _is_transient_graph_write_error(exc: BaseException) -> bool:
     The inner _run_with_retry already handles connection-level transient errors
     (pool reset, TCP failures, etc.).  This predicate covers query-level transient
     errors that survive the connection layer and surface as PGGraphQueryException:
-    deadlocks, serialization conflicts, and lock-acquisition timeouts that can
-    occur under concurrent document ingestion.
+    deadlocks, serialization conflicts, lock-acquisition timeouts, and the Apache
+    AGE label-cache dangling pointer error (``_is_age_dangling_label_error``).
+
+    The dangling-label match needs the graph name, so a write path that wraps its
+    error must put ``"graph_name": self.graph_name`` into the PGGraphQueryException
+    dict; without it the error is not retried.
     """
     if not isinstance(exc, PGGraphQueryException):
         return False
     cause = exc.__cause__
     if cause is None:
         return False
-    return isinstance(
+    if isinstance(
         cause,
         (
             asyncpg.exceptions.DeadlockDetectedError,
@@ -7774,7 +7913,9 @@ def _is_transient_graph_write_error(exc: BaseException) -> bool:
             asyncpg.exceptions.LockNotAvailableError,
             asyncpg.exceptions.QueryCanceledError,
         ),
-    )
+    ):
+        return True
+    return _is_age_dangling_label_error(cause, getattr(exc, "graph_name", None))
 
 
 # Transaction-scoped advisory lock that serialises concurrent upserts of the
@@ -8282,6 +8423,7 @@ class PGGraphStorage(BaseGraphStorage):
                     "wrapped": query,
                     "detail": repr(e),
                     "error_type": e.__class__.__name__,
+                    "graph_name": self.graph_name,
                 }
             ) from e
 
@@ -8710,9 +8852,10 @@ class PGGraphStorage(BaseGraphStorage):
             # Re-raise as PGGraphQueryException so the outer @retry's
             # _is_transient_graph_write_error predicate can inspect __cause__ and
             # retry on DeadlockDetectedError / SerializationError /
-            # LockNotAvailableError / QueryCanceledError — mirrors what _query
-            # does for upsert_node and the rest of the AGE write paths. Without
-            # this wrapping, query-level transient errors from connection.execute
+            # LockNotAvailableError / QueryCanceledError /
+            # Apache AGE label-cache dangling pointer errors (_is_age_dangling_label_error) —
+            # mirrors what _query does for upsert_node and the rest of the AGE write paths.
+            # Without this wrapping, query-level transient errors from connection.execute
             # would surface as raw asyncpg exceptions, fail isinstance() in the
             # predicate, and skip retries.
             if isinstance(e, PGGraphQueryException):
@@ -8726,6 +8869,7 @@ class PGGraphStorage(BaseGraphStorage):
                     "wrapped": cypher_sql,
                     "detail": repr(e),
                     "error_type": e.__class__.__name__,
+                    "graph_name": self.graph_name,
                 }
             ) from e
 
@@ -8772,6 +8916,7 @@ class PGGraphStorage(BaseGraphStorage):
                     "wrapped": built[0][0] if built else "",
                     "detail": repr(e),
                     "error_type": e.__class__.__name__,
+                    "graph_name": self.graph_name,
                 }
             ) from e
 
@@ -8891,6 +9036,7 @@ class PGGraphStorage(BaseGraphStorage):
                     "wrapped": built[0][0] if built else "",
                     "detail": repr(e),
                     "error_type": e.__class__.__name__,
+                    "graph_name": self.graph_name,
                 }
             ) from e
 

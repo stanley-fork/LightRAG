@@ -1194,6 +1194,28 @@ class TokenBudgetError(Exception):
         )
 
 
+def provider_timeout(timeout: Any) -> Any:
+    """The timeout to hand a provider client, or None to keep the SDK default.
+
+    ``LLM_TIMEOUT`` / ``{ROLE}_LLM_TIMEOUT`` / ``default_llm_timeout`` of 0 (or
+    a negative value) mean "LightRAG sets no timeout; the provider SDK's own
+    default applies" -- never "wait forever". So a number <= 0 maps to None,
+    like an unset value; anything else (a positive number, an
+    ``httpx.Timeout``) is returned unchanged.
+
+    A provider must then OMIT the timeout when this returns None rather than
+    pass ``timeout=None`` on: OpenAI-style SDKs read an explicit None as "no
+    timeout at all", and httpx-based ones time out at once on 0.
+    """
+    if (
+        isinstance(timeout, (int, float))
+        and not isinstance(timeout, bool)
+        and timeout <= 0
+    ):
+        return None
+    return timeout
+
+
 def priority_limit_async_func_call(
     max_size: int,
     llm_timeout: float = None,
@@ -1217,7 +1239,10 @@ def priority_limit_async_func_call(
     Args:
         max_size: Maximum number of concurrent calls
         max_queue_size: Maximum queue capacity to prevent memory overflow
-        llm_timeout: LLM provider timeout (from global config), used to calculate other timeouts
+        llm_timeout: LLM provider timeout (from global config), used to calculate other timeouts.
+            A value <= 0 means the provider SDK's default timeout applies (see
+            ``provider_timeout``): no execution or health-check cap is derived
+            from it, since the client's own timeout bounds the call.
         max_execution_timeout: Maximum time for worker to execute function (defaults to llm_timeout + 30s)
         max_task_duration: Maximum time before health check intervenes (defaults to llm_timeout + 60s)
         cleanup_timeout: Maximum time to wait for cleanup operations (defaults to 2.0s)
@@ -1256,6 +1281,15 @@ def priority_limit_async_func_call(
         # Ensure func is callable
         if not callable(func):
             raise TypeError(f"Expected a callable object, got {type(func)}")
+
+        # A non-positive ``llm_timeout`` means "LightRAG sets no timeout; the
+        # provider SDK's default bounds the call" (see ``provider_timeout``).
+        # Normalize it to the unset state here, otherwise the derivation below
+        # produces a 0s worker budget and ``asyncio.wait_for`` fails every call
+        # before the wrapped function starts.
+        nonlocal llm_timeout
+        if provider_timeout(llm_timeout) is None:
+            llm_timeout = None
 
         # Calculate timeout hierarchy if llm_timeout is provided (Dynamic Timeout Calculation)
         if llm_timeout is not None:
@@ -3084,6 +3118,23 @@ def mark_cancellation_deferred(exc: BaseException) -> None:
     """
     if isinstance(exc, asyncio.CancelledError):
         setattr(exc, _DEFERRED_PAST_CANCEL_ATTR, True)
+
+
+def retract_cancellation_deferred(exc: BaseException) -> None:
+    """Withdraw the stamp after the caller ROLLED BACK what the region wrote.
+
+    ``_wait_deferring_cancellation`` judges only the future it was given: a
+    write that finished after the cancel was requested is stamped as durable.
+    A caller that then undoes that write on its way out -- the upload route
+    unlinking the file it was copying -- must call this once the undo has
+    SUCCEEDED, or the cancellation it re-raises claims a write that no longer
+    exists. Do not call it when the undo failed: what was written is still
+    there, and the stamp is then the truthful report.
+
+    A no-op for anything that is not a stamped cancellation.
+    """
+    if isinstance(exc, asyncio.CancelledError) and cancellation_was_deferred(exc):
+        setattr(exc, _DEFERRED_PAST_CANCEL_ATTR, False)
 
 
 async def _wait_deferring_cancellation(

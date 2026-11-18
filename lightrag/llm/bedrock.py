@@ -23,7 +23,9 @@ from tenacity import (
 from collections.abc import AsyncIterator
 from typing import Any, Union
 
+from lightrag.llm_roles import apply_llm_timeout
 from lightrag.utils import (
+    provider_timeout,
     TruncatedResponse,
     empty_length_truncated_hint,
     format_response_diagnostics,
@@ -98,6 +100,8 @@ def _bedrock_client_kwargs(
         client_kwargs["aws_secret_access_key"] = aws_secret_access_key
     if aws_session_token:
         client_kwargs["aws_session_token"] = aws_session_token
+    # <= 0 or unset keeps botocore's defaults (60s each).
+    timeout = provider_timeout(timeout)
     if timeout is not None:
         client_kwargs["config"] = BotocoreConfig(
             connect_timeout=timeout,
@@ -542,6 +546,7 @@ async def bedrock_complete(
     entity_extraction=False,
     **kwargs,
 ) -> Union[str, AsyncIterator[str]]:
+    apply_llm_timeout(kwargs)
     # Bedrock Converse API has no JSON mode; the shim booleans are absorbed
     # and forwarded so bedrock_complete_if_cache can emit DeprecationWarnings
     # with accurate stack frames.
