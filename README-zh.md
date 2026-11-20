@@ -414,12 +414,21 @@ LightRAG 需要使用到 4 种后台存储类型，分别是：
 - **模型存在缺陷，陷入输出死循环。** 某些模型（尤其是本地部署的 Qwen 模型）在遇到特殊文本时偶尔会陷入无尽的输出死循环。如果是偶发情况，通常只需将该文档重新处理一次即可解决。
 - **专门针对参考文献（P 分块策略）。** 使用段落语义（`P`）分块策略（例如 `LIGHTRAG_PARSER=...-iteP`）时，设置 `CHUNK_P_DROP_REFERENCES=true` 可在分块前自动删除匹配的参考文献块，从而避免参考文献产生大量低价值的实体关系（这是导致超时的常见原因）。也可以通过文件名提示 `paper.[-P(drop_rf=true)].pdf` 对单个文件启用；相关的检测参数（`CHUNK_P_REFERENCES_TAIL_N`、`CHUNK_P_REFERENCES_HEADINGS`）详见 `env.example`。
 
+### 解决 Embedding 超时
+
+类似 `Embedding func: Worker execution timeout after 60s` 的错误来自 Embedding 队列，该队列有独立的超时设置，不跟随 `LLM_TIMEOUT`：
+
+- **超时由 `EMBEDDING_TIMEOUT` 控制（默认 `30`）。** 与 LLM 超时一样，实际的执行超时是所配置值的**两倍**，因此默认值对应报错中的 `60s`。增大 `LLM_TIMEOUT` 对 Embedding 调用没有任何作用。
+- **通常的原因是 Embedding 服务太慢。** 正常情况下一个 Embedding 批次几秒内即可完成，因此增大 `EMBEDDING_TIMEOUT` 往往只是掩盖问题。请先检查 Embedding 服务。
+- **让并发数与服务的处理能力相匹配。** LightRAG 最多同时发送 `EMBEDDING_FUNC_MAX_ASYNC`（默认 `8`）个批次。使用 Ollama 时，请将 `OLLAMA_NUM_PARALLEL` 设置为不小于该值，或调低 `EMBEDDING_FUNC_MAX_ASYNC`，并让 Embedding 模型保持加载状态（`OLLAMA_KEEP_ALIVE=-1`，或使用独立的 Ollama 实例），因为它与 LLM 在显存中来回切换会导致 Embedding 请求停滞。
+
 ### 文档查询阶段其他重要配置
 
 在文档查询阶段还有以下环境变量建议根据实际需要进行调整：
 - **MAX_ENTITY_TOKENS / MAX_RELATION_TOKENS / MAX_TOTAL_TOKENS**：控制召回内容送给LLM上下文的Token长度。召回内容包含`实体`、`关系`和`文本块`三部分，实体和关系的长度可以单独控制长度，文本块的长度由总长度减去实体和关系的长度来控制。
 - **ENABLE_CONTENT_HEADINGS**：控制是否把文本块所在的章节标题送给LLM；默认开启，可以为LLM提供更加丰富的上下文信息，提高回答质量。
 - **ENABLE_LLM_CACHE**：是否允许缓存查询结果。默认开启，相同的查询问题、查询模式、LLM模型参数将返回相同的结果。
+- **KEYWORD_EXTRACTION_JSON_MODE**：控制查询关键词抽取如何向LLM请求结构化输出。`auto`（默认）请求 `response_format={"type": "json_object"}`，仅当服务端拒绝该字段本身时才去掉它重试一次；`json_object` 始终发送，`none` 从不发送。仅当你明确知道服务端的取向时才设为 `json_object` 或 `none`——LM Studio 这类服务只接受 `json_schema`/`text` 并返回 HTTP 400，此前会导致所有 `hybrid`/`local`/`global` 查询都返回 "No relevant context found"。
 - **USER_PROMPT_PREFIX / USER_PROMPT_PREFIX_FILE**：拼接在每个请求的 `user_prompt` 前面的全局指令（对应回答提示词中的"Additional Instructions"部分），为运维方提供一个统一定制LLM输出的入口。拼接是逐字节的、不会自动插入分隔符，请自行在内容结尾加上 `\n\n`。如果请求的 `user_prompt` 为空，该前缀将单独成为送给 LLM 的指令；只有 API 字段 `disable_user_prompt_prefix` 能禁用它，且请求无法读取或替换它。较长或多段落的内容请使用 `USER_PROMPT_PREFIX_FILE`（`PROMPT_DIR/user_prompt` 目录下的 `.md`/`.txt` 文件名），因为 `.env` 中的值必须写在一行内。
 
 ### WebUI 入口与默认入口
