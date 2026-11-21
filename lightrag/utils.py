@@ -5140,11 +5140,11 @@ async def aexport_data(
         entities_data.append(entity_row)
 
     # --- Relations ---
-    for src_entity in all_entities:
-        for tgt_entity in all_entities:
-            if src_entity == tgt_entity:
-                continue
-
+    # Relations are undirected: has_edge(a, b) and has_edge(b, a) answer for
+    # the same edge, so probe each unordered pair once. Probing ordered pairs
+    # exported every relation twice, once per orientation.
+    for src_index, src_entity in enumerate(all_entities):
+        for tgt_entity in all_entities[src_index + 1 :]:
             edge_exists = await chunk_entity_relation_graph.has_edge(
                 src_entity, tgt_entity
             )
@@ -7547,7 +7547,11 @@ async def apply_rerank_if_enabled(
             # Check if results are in the new index-based format
             if first_object is not None and "index" in first_object:
                 # New format: [{"index": 0, "relevance_score": 0.85}, ...]
-                reranked_docs = []
+                # One entry per document: a repeated index would otherwise
+                # take several chunk_top_k slots. Keep its highest score,
+                # as chunk score aggregation does, because provider order
+                # is not trusted (see the sort below).
+                best_by_index: dict[int, dict] = {}
                 for result in rerank_results:
                     normalized_result, _ = normalize_rerank_result(
                         result, len(retrieved_docs)
@@ -7557,17 +7561,28 @@ async def apply_rerank_if_enabled(
 
                     index = normalized_result["index"]
                     relevance_score = normalized_result["relevance_score"]
+                    kept = best_by_index.get(index)
+                    if kept is not None and kept["rerank_score"] >= relevance_score:
+                        continue
 
                     # Get original document and add rerank score
                     doc = retrieved_docs[index].copy()
                     doc["rerank_score"] = relevance_score
-                    reranked_docs.append(doc)
+                    best_by_index[index] = doc
 
+                reranked_docs = list(best_by_index.values())
                 if not reranked_docs:
                     logger.warning(
                         "Rerank returned no usable results, using original chunks"
                     )
                     return retrieved_docs
+
+                # Sort by score instead of trusting the provider already
+                # returned results in relevance order: callers slice this
+                # list positionally (chunk_top_k truncation), so an
+                # unsorted response would silently keep the wrong chunks
+                # despite every chunk carrying a correct rerank_score.
+                reranked_docs.sort(key=lambda d: d["rerank_score"], reverse=True)
 
                 logger.info(
                     f"Successfully reranked: {len(reranked_docs)} chunks from {len(retrieved_docs)} original chunks"
