@@ -5258,6 +5258,13 @@ async def kg_query(
         logger.info("[kg_query] No query context could be built; returning no-result.")
         return None
 
+    # Report the keyword lists themselves: splitting the joined search strings
+    # on ", " again would break a keyword that contains one ("Washington, D.C.").
+    context_result.raw_data.setdefault("metadata", {})["keywords"] = {
+        "high_level": list(hl_keywords) if hl_keywords else [],
+        "low_level": list(ll_keywords) if ll_keywords else [],
+    }
+
     # Return different content based on query parameters
     if query_param.only_need_context and not query_param.only_need_prompt:
         return QueryResult(
@@ -5645,6 +5652,24 @@ def normalize_keyword_extraction_json_mode(value: Any) -> str:
             f"'auto', 'json_object' or 'none', got {value!r}"
         )
     return mode
+
+
+KG_CHUNK_PICK_METHODS = ("VECTOR", "WEIGHT")
+
+
+def normalize_kg_chunk_pick_method(value: Any) -> str:
+    """Return the canonical ``kg_chunk_pick_method``, or raise ``ValueError``.
+
+    Applied once in ``LightRAG.__post_init__``, before the storages snapshot
+    the configuration, so the query path reads only canonical values.
+    """
+    method = value.strip().upper() if isinstance(value, str) else None
+    if method not in KG_CHUNK_PICK_METHODS:
+        raise ValueError(
+            "kg_chunk_pick_method (KG_CHUNK_PICK_METHOD) must be "
+            f"'VECTOR' or 'WEIGHT', got {value!r}"
+        )
+    return method
 
 
 def _is_unsupported_response_format_error(error: BaseException) -> bool:
@@ -6994,19 +7019,11 @@ async def _build_query_context(
     if not context:
         return None
 
-    # Convert keywords strings to lists and add complete metadata to raw_data
-    hl_keywords_list = hl_keywords.split(", ") if hl_keywords else []
-    ll_keywords_list = ll_keywords.split(", ") if ll_keywords else []
-
-    # Add complete metadata to raw_data (preserve existing metadata including query_mode)
+    # Add processing info to raw_data (preserve existing metadata including
+    # query_mode). kg_query fills in metadata["keywords"]: it holds the lists.
     if "metadata" not in raw_data:
         raw_data["metadata"] = {}
 
-    # Update keywords while preserving existing metadata
-    raw_data["metadata"]["keywords"] = {
-        "high_level": hl_keywords_list,
-        "low_level": ll_keywords_list,
-    }
     raw_data["metadata"]["processing_info"] = {
         "total_entities_found": len(search_result.get("final_entities", [])),
         "total_relations_found": len(search_result.get("final_relations", [])),
@@ -7281,7 +7298,15 @@ async def _find_related_text_unit_from_entities(
     # Pick by vector similarity:
     #     The order of text chunks aligns with the naive retrieval's destination.
     #     When reranking is disabled, the text chunks delivered to the LLM tend to favor naive retrieval.
-    if kg_chunk_pick_method == "VECTOR" and query and chunks_vdb:
+    if kg_chunk_pick_method == "VECTOR" and not (query and chunks_vdb):
+        # Without this switch neither branch below runs and every chunk is lost.
+        logger.warning(
+            "Vector similarity chunk selection needs both a query and chunks_vdb, "
+            "falling back to WEIGHT method"
+        )
+        kg_chunk_pick_method = "WEIGHT"
+
+    if kg_chunk_pick_method == "VECTOR":
         num_of_chunks = _vector_chunk_quota(
             max_related_chunks, len(entities_with_chunks)
         )
@@ -7575,7 +7600,15 @@ async def _find_related_text_unit_from_relations(
     # Step 4: Apply the selected chunk selection algorithm
     selected_chunk_ids = []  # Initialize to avoid UnboundLocalError
 
-    if kg_chunk_pick_method == "VECTOR" and query and chunks_vdb:
+    if kg_chunk_pick_method == "VECTOR" and not (query and chunks_vdb):
+        # Without this switch neither branch below runs and every chunk is lost.
+        logger.warning(
+            "Vector similarity chunk selection needs both a query and chunks_vdb, "
+            "falling back to WEIGHT method"
+        )
+        kg_chunk_pick_method = "WEIGHT"
+
+    if kg_chunk_pick_method == "VECTOR":
         num_of_chunks = _vector_chunk_quota(
             max_related_chunks, len(relations_with_chunks)
         )
