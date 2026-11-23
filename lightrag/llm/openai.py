@@ -85,6 +85,19 @@ except ImportError:
 load_dotenv(dotenv_path=".env", override=False)
 
 
+def _chat_usage_counts(usage: Any) -> dict[str, int]:
+    counts = {
+        "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+        "completion_tokens": getattr(usage, "completion_tokens", 0),
+        "total_tokens": getattr(usage, "total_tokens", 0),
+    }
+    details = getattr(usage, "prompt_tokens_details", None)
+    cached_tokens = getattr(details, "cached_tokens", None)
+    if cached_tokens is not None:
+        counts["cached_prompt_tokens"] = cached_tokens
+    return counts
+
+
 class InvalidResponseError(Exception):
     """Custom exception class for triggering retry mechanism"""
 
@@ -784,14 +797,7 @@ async def openai_complete_if_cache(
 
                 # After streaming is complete, track token usage
                 if token_tracker and final_chunk_usage:
-                    # Use actual usage from the API
-                    token_counts = {
-                        "prompt_tokens": getattr(final_chunk_usage, "prompt_tokens", 0),
-                        "completion_tokens": getattr(
-                            final_chunk_usage, "completion_tokens", 0
-                        ),
-                        "total_tokens": getattr(final_chunk_usage, "total_tokens", 0),
-                    }
+                    token_counts = _chat_usage_counts(final_chunk_usage)
                     token_tracker.add_usage(token_counts)
                     logger.debug(f"Streaming token usage (from API): {token_counts}")
                 elif token_tracker:
@@ -872,13 +878,7 @@ async def openai_complete_if_cache(
             # trace is exactly the case that raises, and omitting it would
             # under-report by a full-budget generation.
             if token_tracker and hasattr(response, "usage"):
-                token_counts = {
-                    "prompt_tokens": getattr(response.usage, "prompt_tokens", 0),
-                    "completion_tokens": getattr(
-                        response.usage, "completion_tokens", 0
-                    ),
-                    "total_tokens": getattr(response.usage, "total_tokens", 0),
-                }
+                token_counts = _chat_usage_counts(response.usage)
                 token_tracker.add_usage(token_counts)
 
             # Compatible gateways can return non-JSON bodies that the SDK
@@ -1196,7 +1196,7 @@ async def openai_embed(
             default (600 s), as in ``openai_complete_if_cache``.
 
     Returns:
-        A numpy array of embeddings, one per input text.
+        A numpy array of embeddings, one per input text in input order.
 
     Raises:
         APIConnectionError: If there is a connection error with the OpenAI API.
@@ -1296,12 +1296,28 @@ async def openai_embed(
             }
             token_tracker.add_usage(token_counts)
 
+        rows = response.data
+        # Some compatible endpoints omit indices entirely. Preserve their
+        # response order, but never accept an ambiguous partially indexed batch.
+        indices = [getattr(row, "index", None) for row in rows]
+        if any(index is not None for index in indices):
+            if (
+                len(indices) != len(texts)
+                or any(type(index) is not int for index in indices)
+                or set(indices) != set(range(len(texts)))
+            ):
+                raise ValueError(
+                    f"OpenAI-compatible API returned invalid embedding indices "
+                    f"for {len(texts)} texts (first 10: {indices[:10]})"
+                )
+            rows = sorted(rows, key=lambda row: row.index)
+
         return np.array(
             [
                 np.array(dp.embedding, dtype=np.float32)
                 if isinstance(dp.embedding, list)
                 else np.frombuffer(base64.b64decode(dp.embedding), dtype=np.float32)
-                for dp in response.data
+                for dp in rows
             ]
         )
     finally:
